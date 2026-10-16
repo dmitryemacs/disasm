@@ -167,6 +167,28 @@ reported by the backend and NAME/TARGET-ID its symbolic names."
   live-file
   breakpoints breakpoints-buffer hit-breakpoint error)
 
+;;; Events
+
+(defvar disasm-debug-event-hook nil
+  "Hook run whenever the debugger reports an asynchronous event.
+Each function is called with the `disasm-debug-session' the event
+belongs to and a plist describing it.  The `:kind' entry says what
+happened:
+
+  :started  the target was launched or attached (PID available)
+  :running  the target resumed (THREAD, when known)
+  :stopped  the target stopped (REASON, BREAKPOINT and THREAD)
+  :exited   the debugger or the target exited (STATUS)
+
+This is the extension point third parties (activity logs, tests, the
+MCP endpoint) use to observe debugging without polling; the debugger
+itself never consults it, so it is safe to add and remove functions at
+any time.")
+
+(defun disasm-debug--notify (session event)
+  "Run `disasm-debug-event-hook' for SESSION with EVENT."
+  (run-hook-with-args 'disasm-debug-event-hook session event))
+
 ;;; Helpers
 
 (defun disasm-debug-module-for-address (modules addr)

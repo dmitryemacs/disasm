@@ -190,7 +190,12 @@ Return a list of `disasm-debug-thread'."
          (let ((pid (disasm-mi-field (plist-get record :data) "pid")))
            (when (and pid (null (disasm-debug-session-pid session)))
              (setf (disasm-debug-session-pid session) (string-to-number pid))
-             (disasm-debug--rename-listing session))))))
+             (disasm-debug--rename-listing session))
+           (disasm-debug--notify
+            session
+            (list :kind 'started
+                  :pid (or (disasm-debug-session-pid session)
+                           (and pid (string-to-number pid)))))))))
      ((eq type ?*)
       (pcase (plist-get record :class)
         ("stopped"
@@ -210,9 +215,21 @@ Return a list of `disasm-debug-thread'."
                  (if (and reason (string-prefix-p "exited" reason))
                      'exited
                    'stopped))
+           (disasm-debug--notify
+            session
+            (list :kind (if (and reason (string-prefix-p "exited" reason))
+                            'exited
+                          'stopped)
+                  :reason reason
+                  :breakpoint (disasm-debug-session-hit-breakpoint session)
+                  :thread thread))
            (disasm-debug-gdb-refresh session)))
         ("running"
          (setf (disasm-debug-session-state session) 'running)
+         (disasm-debug--notify session (list :kind 'running
+                                             :thread (disasm-mi-field
+                                                      (plist-get record :data)
+                                                      "thread-id")))
          (disasm-debug--ui-refresh session)))))))
 
 ;;; Commands

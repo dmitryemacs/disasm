@@ -600,6 +600,7 @@ Also refreshes the live hex pane, which follows the listing."
   (unless (memq (disasm-debug-session-state session) '(detached error))
     (setf (disasm-debug-session-state session) 'exited))
   (ignore-errors (disasm-debug-pane--refresh session))
+  (disasm-debug--notify session (list :kind 'exited :status status))
   (message "disasm: debugger for %s exited (%s)"
            (disasm-debug-session-name session) status))
 
@@ -668,17 +669,27 @@ then be debugged like an attached process."
   (pcase (disasm-debug-session-backend session)
     ('gdb-mi (disasm-debug-gdb-detach session))))
 
+(defun disasm-debug--exec (session operation)
+  "Run OPERATION on SESSION, whatever buffer is current.
+The session state is updated when the debugger reports the resulting
+asynchronous `*running' or `*stopped' event."
+  (pcase (disasm-debug-session-backend session)
+    ('gdb-mi
+     (pcase operation
+       ('continue (disasm-debug-gdb-continue session))
+       ('stepi (disasm-debug-gdb-stepi session))
+       ('nexti (disasm-debug-gdb-nexti session))
+       ('finish (disasm-debug-gdb-finish session))
+       ('interrupt (disasm-debug-gdb-interrupt session))
+       (_ (user-error "Unknown debug operation: %s" operation))))
+    (_ (user-error "Unknown debugger backend: %s"
+                   (disasm-debug-session-backend session)))))
+
 (defun disasm-debug--run (operation)
   "Run OPERATION on the current buffer's debug session.
 The session state is updated when the debugger reports the resulting
 asynchronous `*running' or `*stopped' event."
-  (let ((session (disasm-debug--current-session)))
-    (pcase operation
-      ('continue (disasm-debug-gdb-continue session))
-      ('stepi (disasm-debug-gdb-stepi session))
-      ('nexti (disasm-debug-gdb-nexti session))
-      ('finish (disasm-debug-gdb-finish session))
-      ('interrupt (disasm-debug-gdb-interrupt session)))))
+  (disasm-debug--exec (disasm-debug--current-session) operation))
 
 (defun disasm-debug-continue ()
   "Resume execution of the debugged process (F5)."
