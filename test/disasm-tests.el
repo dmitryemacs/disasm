@@ -826,12 +826,13 @@
                       ((symbol-function 'disasm-sync--tick) #'ignore))
               (disasm-debug--ensure-layout session))
             (let ((buffers (mapcar #'window-buffer (window-list))))
-              ;; listing + hex + registers + flags + stack, nothing else
-              (should (= (length buffers) 5))
+              ;; listing + hex + registers + flags + threads + stack
+              (should (= (length buffers) 6))
               (should (memq listing buffers))
               (should-not (memq foreign buffers))))
         (dolist (b (list (disasm-debug-session-registers-buffer session)
                          (disasm-debug-session-flags-buffer session)
+                         (disasm-debug-session-threads-buffer session)
                          (disasm-debug-session-stack-buffer session)
                          (disasm-debug-session-hex-buffer session)
                          listing foreign))
@@ -1045,6 +1046,297 @@
     (should (= (disasm-debug-frame-addr (nth 0 frames)) #x401000))
     (should (equal (disasm-debug-frame-func (nth 0 frames)) "main"))
     (should (= (disasm-debug-frame-level (nth 1 frames)) 1))))
+
+;;; Threads and frames
+
+(defun disasm-test--gdb-refresh (session &optional frames threads)
+  "Run a canned `disasm-debug-gdb-refresh' round trip on SESSION.
+FRAMES and THREADS are the canned \"^done\" records answered for
+`-stack-list-frames' and `-thread-info'.  Return a plist with the :commands
+that were sent, in order, and the number of :refreshes of the UI."
+  (let ((frame-record (or frames (disasm-mi--parse-record ?^ "done")))
+        (thread-record (or threads (disasm-mi--parse-record ?^ "done")))
+        (commands nil)
+        (refreshes 0))
+    ;; the refresh chain is gated on having a client at all
+    (unless (disasm-debug-session-client session)
+      (setf (disasm-debug-session-client session) 'canned))
+    (cl-letf (((symbol-function 'disasm-debug-gdb--console)
+               (lambda (_session command callback)
+                 (funcall callback
+                          (if (equal command "info registers")
+                              "rax            0x10\n"
+                            "")
+                          nil)))
+              ((symbol-function 'disasm-mi-send)
+               (lambda (_client command callback)
+                 (push command commands)
+                 (funcall callback (if (equal command "-stack-list-frames")
+                                       frame-record
+                                     thread-record))))
+              ((symbol-function 'disasm-debug--ui-refresh)
+               (lambda (_session) (setq refreshes (1+ refreshes)))))
+      (disasm-debug-gdb-refresh session))
+    (list :commands (nreverse commands) :refreshes refreshes)))
+
+(ert-deftest disasm-test-gdb-parse-threads ()
+  (let* ((record (disasm-mi--parse-record
+                  ?^ (concat "done,threads=["
+                             "{id=\"1\",target-id=\"pid 7,ThreadId 0x7\","
+                             "name=\"prog\",state=\"stopped\"},"
+                             "{id=\"2\",target-id=\"pid 7,ThreadId 0x8\","
+                             "name=\"prog\",state=\"running\"}],"
+                             "current-thread-id=\"1\"")))
+         (threads (disasm-debug-gdb--threads-from-record record)))
+    (should (= (length threads) 2))
+    (should (equal (disasm-debug-thread-id (nth 0 threads)) "1"))
+    (should (equal (disasm-debug-thread-name (nth 0 threads)) "prog"))
+    (should (equal (disasm-debug-thread-target-id (nth 0 threads))
+                   "pid 7,ThreadId 0x7"))
+    (should (equal (disasm-debug-thread-state (nth 0 threads)) "stopped"))
+    (should (equal (disasm-debug-thread-state (nth 1 threads)) "running"))
+    (should (equal (disasm-mi-field (plist-get record :data) "current-thread-id")
+                   "1"))))
+
+(ert-deftest disasm-test-gdb-parse-threads-empty ()
+  (should (null (disasm-debug-gdb--threads-from-record
+                 (disasm-mi--parse-record ?^ "done")))))
+
+(ert-deftest disasm-test-gdb-refresh-reads-threads ()
+  (let ((session (disasm-debug-session--create :state 'stopped :bits 64))
+        (result nil))
+    (setq result
+          (disasm-test--gdb-refresh
+           session
+           (disasm-mi--parse-record
+            ?^ (concat "done,stack=[{level=\"0\",addr=\"0x401000\","
+                       "func=\"main\"},{level=\"1\",addr=\"0x402000\","
+                       "func=\"start\"}]"))
+           (disasm-mi--parse-record
+            ?^ (concat "done,threads=[{id=\"1\",name=\"prog\","
+                       "state=\"stopped\"}],current-thread-id=\"1\""))))
+    (should (equal (plist-get result :commands)
+                   '("-stack-list-frames" "-thread-info")))
+    (should (= (plist-get result :refreshes) 1))
+    (should (equal (disasm-debug-session-registers session)
+                   '(("rax" . "0x10"))))
+    (should (= (length (disasm-debug-session-frames session)) 2))
+    (should (= (length (disasm-debug-session-threads session)) 1))
+    (should (equal (disasm-debug-session-current-thread session) "1"))
+    (should (= (disasm-debug-session-pc session) #x401000))))
+
+(ert-deftest disasm-test-gdb-refresh-pc-follows-selected-frame ()
+  (let ((session (disasm-debug-session--create :state 'stopped :bits 64
+                                               :current-frame 1)))
+    (disasm-test--gdb-refresh
+     session
+     (disasm-mi--parse-record
+      ?^ (concat "done,stack=[{level=\"0\",addr=\"0x401000\","
+                 "func=\"main\"},{level=\"1\",addr=\"0x402000\","
+                 "func=\"start\"}]")))
+    ;; with frame 1 selected the listing follows that frame's address
+    (should (= (disasm-debug-session-pc session) #x402000))))
+
+(ert-deftest disasm-test-gdb-thread-select ()
+  (let ((session (disasm-debug-session--create :state 'stopped))
+        (command nil)
+        (result nil))
+    (cl-letf (((symbol-function 'disasm-mi-send)
+               (lambda (_client cmd callback)
+                 (setq command cmd)
+                 (funcall callback (list :type ?^ :class "done")))))
+      (disasm-debug-gdb-thread-select session "2"
+                                      (lambda (ok) (setq result ok))))
+    (should (equal command "-thread-select 2"))
+    (should result)
+    (should (equal (disasm-debug-session-current-thread session) "2"))
+    ;; switching threads puts the debugger back in the innermost frame
+    (should (= (disasm-debug-session-current-frame session) 0))))
+
+(ert-deftest disasm-test-gdb-thread-select-failure ()
+  (let ((session (disasm-debug-session--create :state 'stopped
+                                               :current-thread "1"))
+        (result t))
+    (cl-letf (((symbol-function 'disasm-mi-send)
+               (lambda (_client _cmd callback)
+                 (funcall callback (list :type ?^ :class "error"
+                                         :data (list (cons "msg" "no")))))))
+      (disasm-debug-gdb-thread-select session "9"
+                                      (lambda (ok) (setq result ok))))
+    (should-not result)
+    ;; a failed selection leaves the state alone
+    (should (equal (disasm-debug-session-current-thread session) "1"))))
+
+(ert-deftest disasm-test-gdb-stack-select-frame ()
+  (let ((session (disasm-debug-session--create :state 'stopped))
+        (command nil)
+        (result nil))
+    (cl-letf (((symbol-function 'disasm-mi-send)
+               (lambda (_client cmd callback)
+                 (setq command cmd)
+                 (funcall callback (list :type ?^ :class "done")))))
+      (disasm-debug-gdb-stack-select-frame session 2
+                                           (lambda (ok) (setq result ok))))
+    (should (equal command "-stack-select-frame 2"))
+    (should result)
+    (should (= (disasm-debug-session-current-frame session) 2))))
+
+(ert-deftest disasm-test-debug-select-frame-dispatch ()
+  (let ((session (disasm-debug-session--create :backend 'gdb-mi :state 'stopped))
+        (command nil))
+    (cl-letf (((symbol-function 'disasm-mi-send)
+               (lambda (_client cmd callback)
+                 (setq command cmd)
+                 (funcall callback (list :type ?^ :class "done")))))
+      (disasm-debug-select-frame session 3))
+    (should (equal command "-stack-select-frame 3"))))
+
+(ert-deftest disasm-test-debug-select-thread-dispatch ()
+  (let ((session (disasm-debug-session--create :backend 'gdb-mi :state 'stopped))
+        (command nil))
+    (cl-letf (((symbol-function 'disasm-mi-send)
+               (lambda (_client cmd callback)
+                 (setq command cmd)
+                 (funcall callback (list :type ?^ :class "done")))))
+      (disasm-debug-select-thread session "4"))
+    (should (equal command "-thread-select 4"))
+    (should (equal (disasm-debug-session-current-thread session) "4"))))
+
+(ert-deftest disasm-test-select-context-requires-stopped ()
+  (let ((session (disasm-debug-session--create :backend 'gdb-mi :state 'running)))
+    (should-error (disasm-debug-select-frame session 1) :type 'user-error)
+    (should-error (disasm-debug-select-thread session "1") :type 'user-error)))
+
+(ert-deftest disasm-test-stopped-resets-frame ()
+  (let ((session (disasm-debug-session--create :state 'stopped)))
+    (setf (disasm-debug-session-current-frame session) 3)
+    (setf (disasm-debug-session-current-thread session) "4")
+    (disasm-debug-gdb--on-record
+     session
+     (disasm-mi--parse-record
+      ?* "stopped,reason=\"breakpoint-hit\",thread-id=\"2\",bkptno=\"1\"")
+     nil)
+    ;; a stop puts the debugger back in the innermost frame of that thread
+    (should (= (disasm-debug-session-current-frame session) 0))
+    (should (equal (disasm-debug-session-current-thread session) "2"))
+    (should (eq (disasm-debug-session-state session) 'stopped))
+    (should (= (disasm-debug-session-hit-breakpoint session) 1))))
+
+(ert-deftest disasm-test-threads-pane-buffer ()
+  (let ((session (disasm-debug-session--create :name "t" :pid 1 :state 'stopped)))
+    (let ((buffer (disasm-debug-pane--get-buffer session 'threads)))
+      (unwind-protect
+          (progn
+            (should (buffer-live-p buffer))
+            (should (eq buffer (disasm-debug-session-threads-buffer session)))
+            (with-current-buffer buffer
+              (should (eq disasm-debug-pane-kind 'threads))))
+        (kill-buffer buffer)))))
+
+(ert-deftest disasm-test-render-threads ()
+  (let ((session (disasm-debug-session--create
+                  :state 'stopped :current-thread "2"
+                  :threads (list (disasm-debug-thread--create
+                                  :id "1" :name "prog" :state "stopped")
+                                 (disasm-debug-thread--create
+                                  :id "2" :name "prog" :state "stopped")))))
+    (with-temp-buffer
+      (disasm-debug-pane-mode)
+      (setq-local buffer-read-only nil)
+      (setq-local disasm-debug-pane-kind 'threads)
+      (setq-local disasm-debug-pane-session session)
+      (disasm-debug-pane--render-threads session)
+      (goto-char (point-min))
+      (should (re-search-forward "^> 2 " nil t))
+      ;; the other thread carries no marker
+      (goto-char (point-min))
+      (should (re-search-forward "^  1 " nil t))
+      ;; every thread line knows the thread it stands for
+      (goto-char (point-min))
+      (re-search-forward "^  1 " nil t)
+      (should (equal (disasm-debug-pane--thread-at-point) "1"))
+      (should-not (disasm-debug-pane--address-at-point)))))
+
+(ert-deftest disasm-test-pane-goto-selects-thread ()
+  (let ((session (disasm-debug-session--create
+                  :state 'stopped
+                  :threads (list (disasm-debug-thread--create
+                                  :id "1" :name "prog" :state "stopped")
+                                 (disasm-debug-thread--create
+                                  :id "2" :name "prog" :state "stopped"))))
+        (chosen nil))
+    (cl-letf (((symbol-function 'disasm-debug-select-thread)
+               (lambda (_session id) (setq chosen id))))
+      (with-temp-buffer
+        (disasm-debug-pane-mode)
+        (setq-local buffer-read-only nil)
+        (setq-local disasm-debug-pane-kind 'threads)
+        (setq-local disasm-debug-pane-session session)
+        (disasm-debug-pane--render-threads session)
+        (goto-char (point-min))
+        (forward-line 2)                ; the second thread
+        (disasm-debug-pane-goto)))
+    (should (equal chosen "2"))))
+
+(ert-deftest disasm-test-pane-goto-selects-frame ()
+  (let ((session (disasm-debug-session--create
+                  :state 'stopped :bits 64 :current-frame 0
+                  :frames (list (disasm-debug-frame--create
+                                 :level 0 :addr #x401000 :func "main")
+                                (disasm-debug-frame--create
+                                 :level 1 :addr #x402000 :func "start"))))
+        (chosen nil))
+    (cl-letf (((symbol-function 'disasm-debug-select-frame)
+               (lambda (_session level) (setq chosen level))))
+      (with-temp-buffer
+        (disasm-debug-pane-mode)
+        (setq-local buffer-read-only nil)
+        (setq-local disasm-debug-pane-kind 'stack)
+        (setq-local disasm-debug-pane-session session)
+        (disasm-debug-pane--render-stack session)
+        (goto-char (point-min))
+        (forward-line 2)                ; frame #1
+        (disasm-debug-pane-goto)))
+    (should (equal chosen 1))))
+
+(ert-deftest disasm-test-render-stack-current-frame ()
+  ;; the marker follows the selected frame, not always the innermost one
+  (let ((session (disasm-debug-session--create
+                  :state 'stopped :bits 64 :current-frame 1
+                  :frames (list (disasm-debug-frame--create
+                                 :level 0 :addr #x401000 :func "main")
+                                (disasm-debug-frame--create
+                                 :level 1 :addr #x402000 :func "start")))))
+    (with-temp-buffer
+      (disasm-debug-pane-mode)
+      (setq-local buffer-read-only nil)
+      (setq-local disasm-debug-pane-kind 'stack)
+      (setq-local disasm-debug-pane-session session)
+      (disasm-debug-pane--render-stack session)
+      (goto-char (point-min))
+      (should (re-search-forward "^>#1 " nil t))
+      (goto-char (point-min))
+      (should (re-search-forward "^ #0 " nil t)))))
+
+(ert-deftest disasm-test-pane-next-threads ()
+  (let ((session (disasm-debug-session--create
+                  :state 'stopped :current-thread "1"
+                  :threads (list (disasm-debug-thread--create
+                                  :id "1" :name "prog" :state "stopped")
+                                 (disasm-debug-thread--create
+                                  :id "2" :name "prog" :state "stopped")))))
+    (with-temp-buffer
+      (disasm-debug-pane-mode)
+      (setq-local buffer-read-only nil)
+      (setq-local disasm-debug-pane-kind 'threads)
+      (setq-local disasm-debug-pane-session session)
+      (disasm-debug-pane--render-threads session)
+      (goto-char (point-min))
+      ;; thread lines are entries for n/p even though they carry no address
+      (disasm-debug-pane-next)
+      (should (equal (disasm-debug-pane--thread-at-point) "1"))
+      (disasm-debug-pane-next)
+      (should (equal (disasm-debug-pane--thread-at-point) "2")))))
 
 ;;; GDB breakpoints and launch
 
