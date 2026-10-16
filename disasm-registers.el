@@ -151,6 +151,7 @@
               (add-text-properties
                start (line-end-position)
                (list 'disasm-debug-addr (disasm--hex-to-int value)
+                     'disasm-debug-register name
                      'mouse-face 'highlight
                      'local-map disasm-debug-pane-entry-map
                      'help-echo "mouse-1: go to this address in the listing"))
@@ -288,6 +289,10 @@
 (defun disasm-debug-pane--address-at-point ()
   "Return the address on the current pane line, or nil."
   (get-text-property (line-beginning-position) 'disasm-debug-addr))
+
+(defun disasm-debug-pane--register-at-point ()
+  "Return the register name on the current pane line, or nil."
+  (get-text-property (line-beginning-position) 'disasm-debug-register))
 
 (defun disasm-debug-pane-goto ()
   "Show the address on the current pane line in the listing."

@@ -399,6 +399,35 @@ to be stopped."
   (disasm-debug-gdb--breakpoints-from-record
    (disasm-mi-request (disasm-debug-session-client session) "-break-list")))
 
+;;; Editing
+
+(defun disasm-debug-gdb-write-register (session name value &optional callback)
+  "Write VALUE to the register NAME of SESSION's target.
+Call CALLBACK with non-nil on success.  The target must be stopped."
+  (disasm-mi-send
+   (disasm-debug-session-client session)
+   (format "-gdb-set $%s = 0x%x" name value)
+   (lambda (record)
+     (let ((ok (equal (plist-get record :class) "done")))
+       (unless ok
+         (message "disasm: cannot set $%s: %s" name
+                  (or (disasm-mi-field (plist-get record :data) "msg") "failed")))
+       (when callback (funcall callback ok))))))
+
+(defun disasm-debug-gdb-write-memory (session address bytes &optional callback)
+  "Write BYTES, a unibyte string, at the live ADDRESS of SESSION's target.
+Call CALLBACK with non-nil on success.  The target must be stopped."
+  (disasm-mi-send
+   (disasm-debug-session-client session)
+   (format "-data-write-memory-bytes 0x%x %s"
+           address (disasm--unibyte-to-hex bytes))
+   (lambda (record)
+     (let ((ok (equal (plist-get record :class) "done")))
+       (unless ok
+         (message "disasm: cannot write memory at 0x%x: %s" address
+                  (or (disasm-mi-field (plist-get record :data) "msg") "failed")))
+       (when callback (funcall callback ok))))))
+
 ;;; Execution control
 
 (defun disasm-debug-gdb-continue (session)

@@ -268,6 +268,10 @@ GDB/MI when reading target memory.  An odd trailing digit is dropped."
             bytes))
     (apply #'unibyte-string (nreverse bytes))))
 
+(defun disasm--unibyte-to-hex (bytes)
+  "Encode the unibyte string BYTES as a lowercase hexadecimal string."
+  (mapconcat (lambda (byte) (format "%02x" byte)) (append bytes nil) ""))
+
 (defun disasm--unibyte-to-int (bytes &optional start count)
   "Read COUNT little-endian bytes of BYTES starting at START as an integer.
 COUNT defaults to the length of BYTES minus START."

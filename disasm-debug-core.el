@@ -184,5 +184,36 @@ was inserted at and FUNC/FILE/LINE its symbolic location, when known."
   (let ((entry (assoc name (disasm-debug-flags))))
     (and entry (/= 0 (logand flags (ash 1 (nth 1 entry)))))))
 
+(defun disasm-debug--parse-value (string)
+  "Parse STRING as a register value and return the integer.
+A \"0x\" prefix selects hexadecimal and a \"0d\" prefix decimal; a plain
+run of hexadecimal digits is read as hexadecimal, following the usual
+debugger convention."
+  (let ((s (string-trim (or string ""))))
+    (cond
+     ((string-empty-p s) (user-error "No value given"))
+     ((string-match-p "\\`0[xX][0-9a-fA-F]+\\'" s)
+      (disasm--hex-to-int s))
+     ((string-match-p "\\`0[dD][0-9]+\\'" s)
+      (string-to-number (substring s 2)))
+     ((string-match-p "\\`[0-9a-fA-F]+\\'" s)
+      (string-to-number s 16))
+     (t (user-error "Invalid value: %s" string)))))
+
+(defun disasm-debug--parse-bytes (string)
+  "Parse STRING into a unibyte string of bytes.
+Separators (spaces, tabs, commas, semicolons, colons, underscores and
+dashes) as well as \"0x\"/\"\\x\" prefixes are ignored; every two
+hexadecimal digits make up one byte."
+  (let* ((s (replace-regexp-in-string "\\\\[xX]\\|0[xX]" "" (or string "")))
+         (s (replace-regexp-in-string "[ \t\r\n,;:_-]" "" s)))
+    (unless (string-match-p "\\`[0-9a-fA-F]*\\'" s)
+      (user-error "Invalid byte string: %s" string))
+    (when (zerop (length s))
+      (user-error "No bytes given"))
+    (when (cl-oddp (length s))
+      (user-error "An even number of hexadecimal digits is required: %s" string))
+    (disasm--hex-string-to-unibyte s)))
+
 (provide 'disasm-debug-core)
 ;;; disasm-debug-core.el ends here

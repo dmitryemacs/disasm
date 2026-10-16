@@ -69,6 +69,9 @@
     (define-key map (kbd "g") #'disasm-debug-goto)
     (define-key map (kbd "f") #'disasm-debug-follow)
     (define-key map (kbd "i") #'disasm-debug-interrupt)
+    (define-key map (kbd "e") #'disasm-debug-edit)
+    (define-key map (kbd "w") #'disasm-debug-write-memory)
+    (define-key map (kbd "E") #'disasm-debug-set-register)
     (define-key map (kbd "c") #'disasm-cache-clear)
     map)
   "Command prefix map for `disasm', bound to \"C-c d\".")
@@ -293,6 +296,10 @@ Detaches from a debugged process first.  Bound to \\`q' in every
 
 ;; The panes can jump straight to a live address.
 (define-key disasm-debug-pane-mode-map (kbd "g") #'disasm-debug-goto)
+
+;; Editing is shared by the panes and the live hex view.
+(define-key disasm-debug-pane-mode-map (kbd "e") #'disasm-debug-edit)
+(define-key disasm-hex-mode-map (kbd "e") #'disasm-debug-edit)
 
 (provide 'disasm)
 

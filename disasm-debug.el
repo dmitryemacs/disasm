@@ -18,10 +18,15 @@
 ;; `disasm-debug-gdb'.
 ;;
 ;;   M-x disasm-attach    attach to a running process (C-c d a)
+;;   M-x disasm-debug-run run a program under the debugger (C-c d R)
 ;;
 ;; Once attached the right-hand column shows the registers, the flags and
 ;; the call stack; the listing follows the program counter and the
-;; instruction at the PC is highlighted.
+;; instruction at the PC is highlighted.  Execution can be controlled
+;; (continue/step/next/finish/interrupt), breakpoints toggled on the
+;; listing and, with \\[disasm-debug-edit], the register or memory under
+;; point can be overwritten (`C-c d w' writes memory at any address and
+;; `C-c d E' sets any register).
 
 ;;; Code:
 
@@ -44,7 +49,9 @@
 (declare-function disasm-goto-address "disasm-mode" (addr))
 (declare-function disasm-hex--get-buffer "disasm-hex" (session))
 (declare-function disasm-hex--render-live "disasm-hex" (base bytes bits))
+(declare-function disasm-hex--live-address-at-point "disasm-hex" ())
 (declare-function disasm-debug-pane--address-at-point "disasm-registers" ())
+(declare-function disasm-debug-pane--register-at-point "disasm-registers" ())
 
 ;;; State
 
@@ -186,6 +193,63 @@ nil when the disassembly fails."
               (disasm-debug--highlight-pc session address))
             (disasm-debug--set-drivers session)
             (disasm-debug--refresh-live-hex session)))))))
+
+;;; Editing
+
+(defun disasm-debug--write-register (session name value callback)
+  "Write VALUE to the register NAME of SESSION, calling CALLBACK with success."
+  (pcase (disasm-debug-session-backend session)
+    ('gdb-mi (disasm-debug-gdb-write-register session name value callback))))
+
+(defun disasm-debug--write-memory (session address bytes callback)
+  "Write BYTES at the live ADDRESS of SESSION, calling CALLBACK with success."
+  (pcase (disasm-debug-session-backend session)
+    ('gdb-mi (disasm-debug-gdb-write-memory session address bytes callback))))
+
+(defun disasm-debug--refresh-state (session)
+  "Re-read SESSION's state from the debugger and refresh the UI."
+  (pcase (disasm-debug-session-backend session)
+    ('gdb-mi (disasm-debug-gdb-refresh session))))
+
+(defun disasm-debug--register-at-point ()
+  "Return the register name at point, or nil."
+  (and (derived-mode-p 'disasm-debug-pane-mode)
+       (disasm-debug-pane--register-at-point)))
+
+(defun disasm-debug--live-address-at-point (session)
+  "Return the live address at point, or nil.
+Works in a live hex pane, in a state pane and in the debug listing."
+  (cond
+   ((derived-mode-p 'disasm-hex-mode)
+    (disasm-hex--live-address-at-point))
+   ((derived-mode-p 'disasm-debug-pane-mode)
+    (disasm-debug-pane--address-at-point))
+   ((derived-mode-p 'disasm-mode)
+    (disasm-debug--listing-live-address session))
+   (t nil)))
+
+(defun disasm-debug--reload-live-hex (session)
+  "Re-read SESSION's live hex pane at its current base address."
+  (let ((base (disasm-debug-session-hex-base session)))
+    (when base
+      (let ((bytes (disasm-debug-read-memory session base disasm-debug-hex-window)))
+        (when bytes
+          (setf (disasm-debug-session-hex-length session) (length bytes))
+          (let ((hexbuf (disasm-debug-session-hex-buffer session)))
+            (when (buffer-live-p hexbuf)
+              (with-current-buffer hexbuf
+                (disasm-hex--render-live base bytes
+                                         (or (disasm-debug-session-bits session) 64))
+                (setq-local disasm--session
+                            (disasm-debug--listing-session session))))))))))
+
+(defun disasm-debug--after-memory-write (session address)
+  "Refresh the views of SESSION after memory at ADDRESS was written."
+  (let ((base (disasm-debug-session-hex-base session))
+        (len (disasm-debug-session-hex-length session)))
+    (if (and base len (> len 0) (<= base address) (< address (+ base len)))
+        (disasm-debug--reload-live-hex session)
+      (disasm-debug--load-live-hex session address))))
 
 ;;; Highlighting
 
@@ -713,6 +777,129 @@ address on the current line."
   (let* ((session (disasm-debug--current-session))
          (buffer (disasm-debug-pane--get-buffer session 'breakpoints)))
     (pop-to-buffer buffer)))
+
+;;; Editing commands
+
+(defun disasm-debug-edit-register ()
+  "Set the register on the current line to a new value."
+  (interactive)
+  (let* ((session (disasm-debug--current-session))
+         (name (disasm-debug--register-at-point)))
+    (unless name (user-error "No register on this line"))
+    (unless (eq (disasm-debug-session-state session) 'stopped)
+      (user-error "The target must be stopped to edit registers"))
+    (let* ((current (cdr (assoc name (disasm-debug-session-registers session))))
+           (value (disasm-debug--parse-value
+                   (read-string
+                    (format "New value for %s%s (hex): " name
+                            (if current (format " [%s]" current) ""))
+                    nil nil
+                    (and current (string-remove-prefix "0x" current))))))
+      (disasm-debug--write-register
+       session name value
+       (lambda (ok)
+         (when ok
+           (message "disasm: %s = 0x%x" name value)
+           (disasm-debug--refresh-state session)))))))
+
+(defun disasm-debug-set-register (session name value)
+  "Set the register NAME of SESSION's target to VALUE.
+VALUE is read as hexadecimal unless it carries a \"0d\" decimal prefix."
+  (interactive
+   (let* ((session (disasm-debug--current-session))
+          (default (disasm-debug--register-at-point))
+          (name (read-string (if default
+                                 (format "Register [%s]: " default)
+                               "Register: ")
+                             nil nil default))
+          (current (cdr (assoc name (disasm-debug-session-registers session)))))
+     (list session name
+           (disasm-debug--parse-value
+            (read-string
+             (format "New value for %s%s (hex): " name
+                     (if current (format " [%s]" current) ""))
+             nil nil
+             (and current (string-remove-prefix "0x" current)))))))
+  (when (string-empty-p name)
+    (user-error "No register given"))
+  (unless (eq (disasm-debug-session-state session) 'stopped)
+    (user-error "The target must be stopped to edit registers"))
+  (disasm-debug--write-register
+   session name value
+   (lambda (ok)
+     (when ok
+       (message "disasm: %s = 0x%x" name value)
+       (disasm-debug--refresh-state session)))))
+
+(defun disasm-debug-edit-memory-at (session address)
+  "Prompt for bytes and write them at the live ADDRESS of SESSION."
+  (unless (eq (disasm-debug-session-state session) 'stopped)
+    (user-error "The target must be stopped to edit memory"))
+  (let ((bytes (disasm-debug--parse-bytes
+                (read-string
+                 (format "Bytes at %s (hex): "
+                         (disasm--format-address
+                          address (or (disasm-debug-session-bits session) 64)))))))
+    (disasm-debug--write-memory
+     session address bytes
+     (lambda (ok)
+       (when ok
+         (message "disasm: wrote %d byte%s at %s"
+                  (length bytes) (if (= 1 (length bytes)) "" "s")
+                  (disasm--format-address address
+                                          (or (disasm-debug-session-bits session) 64)))
+         (disasm-debug--after-memory-write session address))))))
+
+(defun disasm-debug-edit-memory ()
+  "Overwrite the bytes at point in a live hex pane."
+  (interactive)
+  (let* ((session (disasm-debug--current-session))
+         (address (disasm-debug--live-address-at-point session)))
+    (unless (and (bound-and-true-p disasm-hex--live) address)
+      (user-error "Not a live memory byte"))
+    (disasm-debug-edit-memory-at session address)))
+
+(defun disasm-debug-write-memory (session address bytes)
+  "Write BYTES at the live ADDRESS of SESSION's target.
+ADDRESS is read as hexadecimal and BYTES as a run of hexadecimal digits."
+  (interactive
+   (let* ((session (disasm-debug--current-session))
+          (default (disasm-debug--live-address-at-point session)))
+     (list session
+           (disasm--hex-to-int
+            (read-string
+             (format "Address%s (hex): "
+                     (if default
+                         (format " [%s]"
+                                 (disasm--format-address
+                                  default
+                                  (or (disasm-debug-session-bits session) 64)))
+                       ""))
+             nil nil (and default (format "%x" default))))
+           (disasm-debug--parse-bytes (read-string "Bytes (hex): ")))))
+  (unless (eq (disasm-debug-session-state session) 'stopped)
+    (user-error "The target must be stopped to edit memory"))
+  (disasm-debug--write-memory
+   session address bytes
+   (lambda (ok)
+     (when ok
+       (message "disasm: wrote %d byte%s at %s"
+                (length bytes) (if (= 1 (length bytes)) "" "s")
+                (disasm--format-address address
+                                        (or (disasm-debug-session-bits session) 64)))
+       (disasm-debug--after-memory-write session address)))))
+
+(defun disasm-debug-edit ()
+  "Edit the register or memory at point (C-c d e).
+In a registers pane the register on the current line is changed; in a
+live hex pane the bytes under point are overwritten."
+  (interactive)
+  (cond
+   ((derived-mode-p 'disasm-debug-pane-mode)
+    (call-interactively #'disasm-debug-edit-register))
+   ((derived-mode-p 'disasm-hex-mode)
+    (call-interactively #'disasm-debug-edit-memory))
+   (t (user-error "Nothing to edit here"))))
 
 (defun disasm-debug--goto-address (session addr)
   "Show the live address ADDR in SESSION's listing."

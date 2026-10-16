@@ -250,6 +250,27 @@ the live address itself."
   "Return the file offset at the beginning of the current line."
   (* 16 (1- (line-number-at-pos))))
 
+(defun disasm-hex--byte-index-at-point ()
+  "Return the zero-based index of the byte under point in a hex line, or nil.
+Both the hexadecimal and the printable-ASCII column are recognised."
+  (let* ((col (current-column))
+         (prefix disasm--hex-prefix)
+         (hex-end (+ prefix (* 16 3)))
+         (ascii-start (+ prefix (* 16 3) 2)))
+    (cond
+     ((and (>= col prefix) (< col hex-end))
+      (/ (- col prefix) 3))
+     ((>= col ascii-start)
+      (min 15 (- col ascii-start)))
+     (t nil))))
+
+(defun disasm-hex--live-address-at-point ()
+  "Return the live address of the byte under point in a live hex pane, or nil."
+  (when (and disasm-hex--live disasm-hex--base)
+    (let ((index (disasm-hex--byte-index-at-point)))
+      (when index
+        (+ disasm-hex--base (* 16 (1- (line-number-at-pos))) index)))))
+
 (defun disasm--hex-highlight-bytes (buffer offset size)
   "Highlight SIZE bytes at file OFFSET in hex BUFFER."
   (when (buffer-live-p buffer)
