@@ -239,7 +239,66 @@ Hex-панель показывает файл построчно: колонк�
   вокруг PC для адресов вне модулей с файлом (по умолчанию `#x4000`).
 - `disasm-debug-hex-window` — сколько байт живой памяти показывать в
   hex-панели при отладке (по умолчанию `#x1000`).
+- `disasm-mcp-auto-start` — поднимать ли MCP-слушатель при загрузке
+  `disasm` (по умолчанию да).
+- `disasm-mcp-host` / `disasm-mcp-port` — адрес и порт слушателя
+  (`127.0.0.1` / `37373`).
+- `disasm-mcp-token-file` — файл с токеном доступа (по умолчанию
+  `disasm-mcp-token` в `user-emacs-directory`).
+- `disasm-mcp-follow-agent` — переводить ли листинг и hex к адресу, который
+  смотрит агент (по умолчанию да).
+- `disasm-mcp-log-limit` — сколько записей хранить в журнале агента
+  (по умолчанию 500).
 - лица `disasm-*-face` для цветов.
+
+## Управление извне (MCP)
+
+Отладчик можно водить не только с клавиатуры, но и из агента, говорящего
+на [Model Context Protocol](https://modelcontextprotocol.io) — например,
+из OpenCode. `disasm-mcp.el` поднимает на петлевом интерфейсе маленький
+TCP-слушатель, а `mcp/disasm-mcp-server.mjs` (Node, без сторонних
+зависимостей) переводит MCP-вызовы в запросы к этому слушателю.
+
+Ключевой момент: агент вызывает **те же** команды, что и `F5`/`F10`/`F11`,
+поэтому всё, что он делает, сразу видно в панелях, листинге и hex-виде.
+Ход работы агента пишется в буфер `*disasm-agent*`:
+
+- `C-c d L` (`M-x disasm-mcp-log`) — открыть журнал агента. Строка на
+  запрос: время, операция, аргументы, итог; `RET` переходит к адресу
+  запроса, `TAB` показывает/скрывает подробности.
+- В строке режима горит `mcp` (или `mcp:<операция>`), пока слушатель
+  открыт.
+
+### Включение
+
+Слушатель стартует сам при загрузке `disasm` (настройка
+`disasm-mcp-auto-start`). Токен доступа кладётся в
+`~/.emacs.d/disasm-mcp-token` (`disasm-mcp-token-file`), порт по
+умолчанию `37373` (`disasm-mcp-port`). Вручную:
+
+- `M-x disasm-mcp-start` / `M-x disasm-mcp-stop` — поднять/остановить
+  слушатель.
+
+### Подключение к OpenCode
+
+```sh
+opencode mcp add disasm --global -- \
+  node "$HOME/.emacs.d/lisp/disasm/mcp/disasm-mcp-server.mjs"
+```
+
+Проверить: `opencode mcp list` — сервер `disasm` должен быть connected.
+Адрес, порт и файл токена сервер берёт из переменных окружения
+`DISASM_MCP_HOST`, `DISASM_MCP_PORT`, `DISASM_MCP_TOKEN_FILE` (значения по
+умолчанию совпадают с настройками Emacs).
+
+### Инструменты
+
+`sessions`, `state` (секции `registers`, `flags`, `threads`, `frames`,
+`modules`, `breakpoints`), `disassemble`, `read_memory`, `write_memory`,
+`set_register`, `goto`, `select_thread`, `select_frame`, `breakpoint`
+(постановка/снятие/список), `step` (`stepi`/`nexti`/`finish`), `continue`,
+`interrupt`, `attach`, `launch`, `detach`, `open_file`, `wait` (дождаться
+остановки цели). Протокол и подключение подробнее — в `mcp/README.md`.
 
 ## Тесты
 
@@ -269,7 +328,10 @@ disasm-debug-core.el типы, defcustom и лица отладчика
 disasm-debug-gdb.el бэкенд отладчика поверх GDB/MI
 disasm-registers.el панели регистров, флагов и стека
 disasm-debug.el    команды, раскладка и обновление отладочных панелей
+disasm-mcp.el      MCP-эндпоинт: слушатель, журнал агента, режим
 disasm.el          точка входа (disasm-file/open/open-raw/buffer/attach)
+mcp/disasm-mcp-server.mjs  MCP-сервер (stdio ↔ TCP), инструменты агента
+mcp/test/bridge.test.mjs   тесты моста (node --test)
 test/disasm-tests.el
 ```
 
