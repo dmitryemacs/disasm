@@ -1850,5 +1850,956 @@ that were sent, in order, and the number of :refreshes of the UI."
   (should (eq (lookup-key disasm-hex-mode-map (kbd "e"))
               #'disasm-debug-edit)))
 
+;;; M13: the MCP endpoint
+
+(defun disasm-test--mcp-session (&rest args)
+  "Build a stopped debug session for MCP tests, with ARGS overridden.
+The session has a listing session of two instructions at 0x401000 and
+0x401005 (file virtual addresses) and a load delta of #x1000, so live
+addresses start at #x402000."
+  (let* ((insns (vector (disasm-insn--create :addr #x401000 :bytes "55"
+                                             :mnemonic "push" :operands "rbp"
+                                             :size 1 :line 1)
+                        (disasm-insn--create :addr #x401005 :bytes "c3"
+                                             :mnemonic "ret" :operands ""
+                                             :size 1 :line 1)))
+         (listing (with-current-buffer (get-buffer-create " *disasm-test-listing*")
+                    (setq-local disasm--session
+                                (disasm-session--create :file "t.exe" :format "pei-x86-64"
+                                                        :arch "i386:x86-64" :bits 64
+                                                        :insns insns :state 'ready))
+                    (current-buffer)))
+         (defaults (list :backend 'gdb-mi :state 'stopped :bits 64
+                         :arch "i386:x86-64" :pid 4242 :name "t.exe"
+                         :exe "C:/t.exe" :pc #x402000 :listing listing
+                         :delta #x1000
+                         :registers '(("rax" . "0x10") ("rip" . "0x402000"))
+                         :flags #x246))
+         ;; `cl-defstruct' constructors keep the first of a repeated key,
+         ;; so the caller's ARGS have to come before the defaults.
+         (session (apply #'disasm-debug-session--create
+                         (append args defaults))))
+    ;; Register the session so that `disasm-mcp--sessions' finds it, just
+    ;; as the debugger's own panes and listing buffers do.
+    (with-current-buffer (get-buffer-create " *disasm-test-session*")
+      (setq-local disasm-debug--session session))
+    session))
+
+(defun disasm-test--mcp-cleanup (session)
+  "Drop the buffers SESSION's tests created."
+  (let ((listing (disasm-debug-session-listing session)))
+    (when (buffer-live-p listing)
+      (kill-buffer listing)))
+  (let ((holder (get-buffer " *disasm-test-session*")))
+    (when (buffer-live-p holder)
+      (kill-buffer holder))))
+
+(ert-deftest disasm-test-mcp-json-encodes-lisp-values ()
+  ;; keyword plists are objects, vectors are arrays, nil is false,
+  ;; :json-null is null and other symbols become strings
+  (should (equal (disasm-mcp--json '(:a t :b nil :c :json-null :d "x" :e [1 2]))
+                 "{\"a\":true,\"b\":false,\"c\":null,\"d\":\"x\",\"e\":[1,2]}"))
+  (should (equal (disasm-mcp--json (list :kind 'stopped))
+                 "{\"kind\":\"stopped\"}"))
+  (should (equal (disasm-mcp--json (list :empty (vector))) "{\"empty\":[]}"))
+  (should (equal (disasm-mcp--json (list :nested (list :n 1)))
+                 "{\"nested\":{\"n\":1}}")))
+
+(ert-deftest disasm-test-mcp-json-parses-requests ()
+  (let ((request (disasm-mcp--parse-json
+                  "{\"id\":7,\"token\":\"t\",\"op\":\"read_memory\",\"args\":{\"address\":\"0x10\",\"length\":4}}")))
+    (should (equal (alist-get 'id request) 7))
+    (should (equal (disasm-mcp--arg-string request 'op) "read_memory"))
+    (should (equal (disasm-mcp--arg (alist-get 'args request) 'address) "0x10"))
+    (should (= (disasm-mcp--arg-number (alist-get 'args request) 'length) 4)))
+  ;; arrays arrive as lists, null is dropped in favour of the default
+  (let ((args (alist-get 'args (disasm-mcp--parse-json
+                                "{\"args\":{\"include\":[\"registers\",\"flags\"],\"session\":null}}"))))
+    (should (equal (disasm-mcp--arg args 'include) '("registers" "flags")))
+    (should (equal (disasm-mcp--arg args 'session 'default) 'default)))
+  (should-not (disasm-mcp--parse-json "not json")))
+
+(ert-deftest disasm-test-mcp-arg-address ()
+  (should (= (disasm-mcp--arg-address '((address . "0x401000")) 'address) #x401000))
+  (should (= (disasm-mcp--arg-address '((address . "401000")) 'address) #x401000))
+  (should (= (disasm-mcp--arg-address '((address . 4096)) 'address) 4096))
+  (should-error (disasm-mcp--arg-address '() 'address) :type 'user-error)
+  (should-error (disasm-mcp--arg-address '((address . "zz")) 'address) :type 'user-error))
+
+(ert-deftest disasm-test-mcp-sessions-discovers-buffers ()
+  (let* ((one (disasm-debug-session--create :pid 1 :name "one"))
+         (two (disasm-debug-session--create :pid 2 :name "two"))
+         (first (get-buffer-create " *disasm-test-one*"))
+         (second (get-buffer-create " *disasm-test-two*")))
+    (unwind-protect
+        (progn
+          (with-current-buffer first
+            (setq-local disasm-debug--session one))
+          (with-current-buffer second
+            (setq-local disasm-debug--session two))
+          ;; the same session seen through a second pane is not listed twice
+          (with-temp-buffer
+            (setq-local disasm-debug--session two)
+            (let ((sessions (disasm-mcp--sessions)))
+              (should (= (length sessions) 2))
+              (should (memq one sessions))
+              (should (memq two sessions))
+              ;; the default session is one of them
+              (should (memq (disasm-mcp--session nil) sessions))
+              ;; and an explicit id selects the right one
+              (should (eq (disasm-mcp--session '((session . "1"))) one))
+              (should (eq (disasm-mcp--session '((session . "2"))) two))
+              (should-error (disasm-mcp--session '((session . "99")))
+                            :type 'user-error))))
+      (kill-buffer first)
+      (kill-buffer second))))
+
+(ert-deftest disasm-test-mcp-session-selection ()
+  ;; with no session at all the endpoint says so plainly
+  (let ((disasm-debug--session nil))
+    (cl-letf (((symbol-function 'disasm-mcp--sessions) (lambda () nil)))
+      (should-error (disasm-mcp--session nil) :type 'user-error)))
+  (should (equal (disasm-mcp--session-id
+                  (disasm-debug-session--create :name "x"))
+                 "x"))
+  (should (equal (disasm-mcp--session-id
+                  (disasm-debug-session--create :name "x" :pid 7))
+                 "7")))
+
+(ert-deftest disasm-test-mcp-session-json-shape ()
+  (let ((session (disasm-test--mcp-session)))
+    (unwind-protect
+        (let ((json (disasm-mcp--session-json session)))
+          (should (equal (plist-get json :id) "4242"))
+          (should (equal (plist-get json :state) "stopped"))
+          (should (equal (plist-get json :pc_hex) "0x0000000000402000"))
+          (should (= (plist-get json :pc) #x402000))
+          (should (equal (plist-get json :bits) 64)))
+      (disasm-test--mcp-cleanup session))))
+
+(ert-deftest disasm-test-mcp-state-op ()
+  (let ((session (disasm-test--mcp-session
+                  :reason "breakpoint-hit" :hit-breakpoint 3
+                  :current-thread "1" :current-frame 0)))
+    (unwind-protect
+        (let ((result (disasm-mcp--op-state
+                       (list (cons 'session "4242")))))
+          (should (equal (plist-get result :state) "stopped"))
+          (should (eq (plist-get result :stopped) t))
+          (should (eq (plist-get result :exited) nil))
+          (should (equal (plist-get result :reason) "breakpoint-hit"))
+          (should (= (plist-get result :hit_breakpoint) 3))
+          (should (equal (plist-get result :thread) "1"))
+          (should (= (plist-get result :frame) 0))
+          ;; no extra sections unless asked for
+          (should-not (plist-get result :registers)))
+      (disasm-test--mcp-cleanup session))))
+
+(ert-deftest disasm-test-mcp-state-include-sections ()
+  (let* ((session (disasm-test--mcp-session
+                   :threads (list (disasm-debug-thread--create
+                                   :id "1" :name "t.exe" :state "stopped"))
+                   :frames (list (disasm-debug-frame--create
+                                  :level 0 :addr #x401000 :func "main"))
+                   :current-thread "1"
+                   :modules (list (disasm-debug-module--create
+                                   :path "C:/t.exe" :from #x400000 :to #x401000
+                                   :main-p t))
+                   :breakpoints (list (disasm-debug-breakpoint--create
+                                       :number 1 :addr #x402000 :enabled t
+                                       :func "main" :file "t.c" :line 3))))
+         (include '("registers" "flags" "threads"
+                    "frames" "modules" "breakpoints"))
+         (result nil))
+    (unwind-protect
+        (progn
+          (setq result (disasm-mcp--op-state
+                        (list (cons 'session "4242")
+                              (cons 'include include))))
+          (should (= (length (plist-get result :registers)) 2))
+          (should (equal (plist-get (aref (plist-get result :registers) 0) :name)
+                         "rax"))
+          (should (= (plist-get (aref (plist-get result :registers) 0) :int) #x10))
+          (should (= (plist-get (plist-get result :flags) :eflags) #x246))
+          (should (seq-contains-p (plist-get (plist-get result :flags) :set) "ZF"))
+          (should-not (seq-contains-p (plist-get (plist-get result :flags) :set) "CF"))
+          (should (= (length (plist-get result :threads)) 1))
+          (should (eq (plist-get (aref (plist-get result :threads) 0) :current) t))
+          (should (= (length (plist-get result :frames)) 1))
+          ;; frame addresses are reported live, not as file addresses
+          (should (equal (plist-get (aref (plist-get result :frames) 0) :address_hex)
+                         "0x0000000000402000"))
+          (should (= (length (plist-get result :modules)) 1))
+          (should (eq (plist-get (aref (plist-get result :modules) 0) :main) t))
+          (should (= (length (plist-get result :breakpoints)) 1))
+          (should (= (plist-get (aref (plist-get result :breakpoints) 0) :number) 1))
+          (should (eq (plist-get (aref (plist-get result :breakpoints) 0) :enabled) t)))
+      (disasm-test--mcp-cleanup session))))
+
+(ert-deftest disasm-test-mcp-state-unknown-section ()
+  (let ((session (disasm-test--mcp-session)))
+    (unwind-protect
+        (should-error (disasm-mcp--op-state
+                       (list (cons 'session "4242") (cons 'include '("nonsense"))))
+                      :type 'user-error)
+      (disasm-test--mcp-cleanup session))))
+
+(ert-deftest disasm-test-mcp-disassemble-from-file ()
+  (let* ((session (disasm-test--mcp-session :pc #x402005))
+         (result (disasm-mcp--op-disassemble
+                  (list (cons 'session "4242") (cons 'address "0x402000")
+                        (cons 'count 2)))))
+    (unwind-protect
+        (progn
+          (should (equal (plist-get result :source) "file"))
+          (should (= (plist-get result :count) 2))
+          (let ((insns (plist-get result :instructions)))
+            ;; the listing works in file addresses, the answer in live ones
+            (should (= (plist-get (aref insns 0) :address) #x402000))
+            (should (equal (plist-get (aref insns 0) :address_hex)
+                           "0x0000000000402000"))
+            (should (equal (plist-get (aref insns 0) :mnemonic) "push"))
+            (should (= (plist-get (aref insns 1) :address) #x402005))
+            ;; the program counter is marked
+            (should (eq (plist-get (aref insns 1) :current) t))
+            (should (equal (plist-get (aref insns 1) :marker) "=>")))
+          (should (string-match-p "push[[:space:]]+rbp" (plist-get result :text))))
+      (disasm-test--mcp-cleanup session))))
+
+(ert-deftest disasm-test-mcp-disassemble-marks-breakpoints ()
+  (let* ((session (disasm-test--mcp-session
+                   :pc #x402000
+                   :breakpoints (list (disasm-debug-breakpoint--create
+                                       :number 2 :addr #x402005 :enabled t))))
+         (result (disasm-mcp--op-disassemble
+                  (list (cons 'session "4242") (cons 'address "0x402000")))))
+    (unwind-protect
+        (let ((insns (plist-get result :instructions)))
+          (should (equal (plist-get (aref insns 1) :marker) "*"))
+          (should (eq (plist-get (aref insns 1) :current) nil)))
+      (disasm-test--mcp-cleanup session))))
+
+(ert-deftest disasm-test-mcp-disassemble-live ()
+  (let* ((session (disasm-test--mcp-session))
+         (live (disasm-session--create
+                :state 'ready :bits 64
+                :insns (vector (disasm-insn--create :addr #x500000 :bytes "90"
+                                                    :mnemonic "nop" :operands ""
+                                                    :size 1 :line 1)))))
+    (cl-letf (((symbol-function 'disasm-debug--read-window)
+               (lambda (_session address _length)
+                 (should (= address #x500000))
+                 (unibyte-string #x90)))
+              ((symbol-function 'disasm-debug--live-session)
+               (lambda (_session _bytes _arch base)
+                 (should (= base #x500000))
+                 live)))
+      ;; nothing is known about 0x500000, so the file listing cannot help
+      (let ((result (disasm-mcp--op-disassemble
+                     (list (cons 'session "4242") (cons 'address "0x500000")))))
+        (should (equal (plist-get result :source) "live"))
+        (should (= (plist-get (aref (plist-get result :instructions) 0) :address)
+                   #x500000))))
+    (disasm-test--mcp-cleanup session)))
+
+(ert-deftest disasm-test-mcp-disassemble-live-requires-stopped ()
+  (let ((session (disasm-test--mcp-session :state 'running)))
+    (unwind-protect
+        (should-error (disasm-mcp--op-disassemble
+                       (list (cons 'session "4242") (cons 'address "0x900000")))
+                      :type 'user-error)
+      (disasm-test--mcp-cleanup session))))
+
+(ert-deftest disasm-test-mcp-read-memory ()
+  (let ((session (disasm-test--mcp-session)))
+    (unwind-protect
+        (cl-letf (((symbol-function 'disasm-debug-read-memory)
+                   (lambda (_session address length)
+                     (should (= address #x402000))
+                     (should (= length 4))
+                     (unibyte-string #x41 #x42 #x00 #xff))))
+          (let ((result (disasm-mcp--op-read-memory
+                         (list (cons 'session "4242") (cons 'address "0x402000")
+                               (cons 'length 4)))))
+            (should (equal (plist-get result :hex) "414200ff"))
+            (should (equal (plist-get result :ascii) "AB.."))
+            (should (equal (plist-get result :u8) [65 66 0 255])))
+          ;; the format argument picks the interpretation
+          (let ((result (disasm-mcp--op-read-memory
+                         (list (cons 'session "4242") (cons 'address "0x402000")
+                               (cons 'length 4) (cons 'format "u16")))))
+            (should (equal (plist-get result :values) [16961 65280]))))
+      (disasm-test--mcp-cleanup session))))
+
+(ert-deftest disasm-test-mcp-read-memory-requires-stopped ()
+  (let ((session (disasm-test--mcp-session :state 'running)))
+    (unwind-protect
+        (should-error (disasm-mcp--op-read-memory
+                       (list (cons 'session "4242") (cons 'address "0x402000")))
+                      :type 'user-error)
+      (disasm-test--mcp-cleanup session))))
+
+(ert-deftest disasm-test-mcp-read-memory-follows-agent ()
+  (let ((session (disasm-test--mcp-session))
+        (visited nil))
+    (unwind-protect
+        (cl-letf (((symbol-function 'disasm-debug-read-memory)
+                   (lambda (&rest _) (unibyte-string 1 2)))
+                  ((symbol-function 'disasm-debug--goto-address)
+                   (lambda (_session address) (setq visited address))))
+          (let ((disasm-mcp-follow-agent t))
+            (disasm-mcp--op-read-memory
+             (list (cons 'session "4242") (cons 'address "0x402000"))))
+          (should (= visited #x402000))
+          (setq visited nil)
+          (let ((disasm-mcp-follow-agent nil))
+            (disasm-mcp--op-read-memory
+             (list (cons 'session "4242") (cons 'address "0x402000"))))
+          (should-not visited))
+      (disasm-test--mcp-cleanup session))))
+
+(ert-deftest disasm-test-mcp-write-memory ()
+  (let ((session (disasm-test--mcp-session))
+        (command nil)
+        (written nil))
+    (unwind-protect
+        (cl-letf (((symbol-function 'disasm-mi-send)
+                   (lambda (_client cmd callback)
+                     (setq command cmd)
+                     (funcall callback (list :type ?^ :class "done"))))
+                  ((symbol-function 'disasm-debug--after-memory-write)
+                   (lambda (_session address) (setq written address))))
+          (let ((result (disasm-mcp--op-write-memory
+                         (list (cons 'session "4242") (cons 'address "0x402000")
+                               (cons 'bytes "aa bb")))))
+            (should (equal command "-data-write-memory-bytes 0x402000 aabb"))
+            (should (= written #x402000))
+            (should (= (plist-get result :written) 2))
+            (should (equal (plist-get result :hex) "aabb"))))
+      (disasm-test--mcp-cleanup session))))
+
+(ert-deftest disasm-test-mcp-write-memory-requires-stopped ()
+  (let ((session (disasm-test--mcp-session :state 'running)))
+    (unwind-protect
+        (should-error (disasm-mcp--op-write-memory
+                       (list (cons 'session "4242") (cons 'address "0x402000")
+                             (cons 'bytes "aa")))
+                      :type 'user-error)
+      (disasm-test--mcp-cleanup session))))
+
+(ert-deftest disasm-test-mcp-set-register ()
+  (let ((session (disasm-test--mcp-session))
+        (command nil)
+        (refreshed nil))
+    (unwind-protect
+        (cl-letf (((symbol-function 'disasm-mi-send)
+                   (lambda (_client cmd callback)
+                     (setq command cmd)
+                     (funcall callback (list :type ?^ :class "done"))))
+                  ((symbol-function 'disasm-debug--refresh-state)
+                   (lambda (_session) (setq refreshed t))))
+          (let ((result (disasm-mcp--op-set-register
+                         (list (cons 'session "4242") (cons 'name "rax")
+                               (cons 'value "0x42")))))
+            (should (equal command "-gdb-set $rax = 0x42"))
+            (should refreshed)
+            (should (= (plist-get result :value) #x42))
+            (should (equal (plist-get result :value_hex) "0x42"))))
+      (disasm-test--mcp-cleanup session))))
+
+(ert-deftest disasm-test-mcp-set-register-reports-failure ()
+  (let ((session (disasm-test--mcp-session)))
+    (unwind-protect
+        (cl-letf (((symbol-function 'disasm-mi-send)
+                   (lambda (_client _cmd callback)
+                     (funcall callback (list :type ?^ :class "error"
+                                             :data (list (cons "msg" "bad")))))))
+          (should-error (disasm-mcp--op-set-register
+                         (list (cons 'session "4242") (cons 'name "rax")
+                               (cons 'value "0x42")))
+                        :type 'user-error))
+      (disasm-test--mcp-cleanup session))))
+
+(ert-deftest disasm-test-mcp-set-register-requires-name ()
+  (let ((session (disasm-test--mcp-session)))
+    (unwind-protect
+        (should-error (disasm-mcp--op-set-register
+                       (list (cons 'session "4242") (cons 'value "0x42")))
+                      :type 'user-error)
+      (disasm-test--mcp-cleanup session))))
+
+(ert-deftest disasm-test-mcp-breakpoint-set ()
+  (let ((session (disasm-test--mcp-session))
+        (command nil)
+        (refreshed nil))
+    (unwind-protect
+        (cl-letf (((symbol-function 'disasm-mi-send)
+                   (lambda (_client cmd callback)
+                     (setq command cmd)
+                     (funcall callback
+                              (list :type ?^ :class "done"
+                                    :data (list (cons "bkpt"
+                                                      (list (cons "number" "3")
+                                                            (cons "addr" "0x402010")
+                                                           (cons "func" "main"))))))))
+                  ((symbol-function 'disasm-debug--after-breakpoint-change)
+                   (lambda (_session) (setq refreshed t))))
+          (let ((result (disasm-mcp--op-breakpoint
+                         (list (cons 'session "4242") (cons 'action "set")
+                               (cons 'address "0x402010")))))
+            (should (equal command "-break-insert *0x402010"))
+            (should (= (plist-get result :number) 3))
+            (should refreshed)
+            (should (= (length (disasm-debug-session-breakpoints session)) 1))))
+      (disasm-test--mcp-cleanup session))))
+
+(ert-deftest disasm-test-mcp-breakpoint-set-is-idempotent ()
+  (let* ((existing (disasm-debug-breakpoint--create :number 5 :addr #x402000
+                                                    :enabled t))
+         (session (disasm-test--mcp-session :breakpoints (list existing)))
+         (sent nil))
+    (unwind-protect
+        (cl-letf (((symbol-function 'disasm-mi-send)
+                   (lambda (&rest _) (setq sent t))))
+          (let ((result (disasm-mcp--op-breakpoint
+                         (list (cons 'session "4242") (cons 'action "set")
+                               (cons 'address "0x402000")))))
+            ;; an address that already has a breakpoint is not hit twice
+            (should-not sent)
+            (should (= (plist-get result :number) 5))
+            (should (eq (plist-get result :existing) t))))
+      (disasm-test--mcp-cleanup session))))
+
+(ert-deftest disasm-test-mcp-breakpoint-set-failure ()
+  (let ((session (disasm-test--mcp-session)))
+    (unwind-protect
+        (cl-letf (((symbol-function 'disasm-mi-send)
+                   (lambda (_client _cmd callback)
+                     (funcall callback (list :type ?^ :class "error"
+                                             :data (list (cons "msg" "no")))))))
+          (should-error (disasm-mcp--op-breakpoint
+                         (list (cons 'session "4242") (cons 'action "set")
+                               (cons 'address "0x402010")))
+                        :type 'user-error)
+          (should-not (disasm-debug-session-breakpoints session)))
+      (disasm-test--mcp-cleanup session))))
+
+(ert-deftest disasm-test-mcp-breakpoint-list-delete-clear ()
+  (let* ((one (disasm-debug-breakpoint--create :number 1 :addr #x402000 :enabled t))
+         (two (disasm-debug-breakpoint--create :number 2 :addr #x402005 :enabled t))
+         (session (disasm-test--mcp-session :breakpoints (list one two)))
+         (commands nil))
+    (unwind-protect
+        (cl-letf (((symbol-function 'disasm-mi-send)
+                   (lambda (_client cmd callback)
+                     (push cmd commands)
+                     (funcall callback (list :type ?^ :class "done"))))
+                  ((symbol-function 'disasm-debug--after-breakpoint-change) #'ignore))
+          (let ((listed (disasm-mcp--op-breakpoint
+                         (list (cons 'session "4242") (cons 'action "list")))))
+            (should (= (length (plist-get listed :breakpoints)) 2)))
+          (let ((deleted (disasm-mcp--op-breakpoint
+                          (list (cons 'session "4242") (cons 'action "delete")
+                                (cons 'number 1)))))
+            (should (equal (nreverse commands) '("-break-delete 1")))
+            (should (= (plist-get deleted :deleted) 1))
+            (should (= (length (disasm-debug-session-breakpoints session)) 1)))
+          (setq commands nil)
+          (let ((cleared (disasm-mcp--op-breakpoint
+                          (list (cons 'session "4242") (cons 'action "clear")))))
+            (should (equal (nreverse commands) '("-break-delete 2")))
+            (should (= (plist-get cleared :cleared) 1))
+            (should-not (disasm-debug-session-breakpoints session))))
+      (disasm-test--mcp-cleanup session))))
+
+(ert-deftest disasm-test-mcp-breakpoint-delete-by-address ()
+  (let* ((one (disasm-debug-breakpoint--create :number 4 :addr #x402000 :enabled t))
+         (session (disasm-test--mcp-session :breakpoints (list one)))
+         (commands nil))
+    (unwind-protect
+        (cl-letf (((symbol-function 'disasm-mi-send)
+                   (lambda (_client cmd callback)
+                     (push cmd commands)
+                     (funcall callback (list :type ?^ :class "done"))))
+                  ((symbol-function 'disasm-debug--after-breakpoint-change) #'ignore))
+          (disasm-mcp--op-breakpoint
+           (list (cons 'session "4242") (cons 'action "delete")
+                 (cons 'address "0x402000")))
+          (should (equal commands '("-break-delete 4")))
+          (should-error (disasm-mcp--op-breakpoint
+                         (list (cons 'session "4242") (cons 'action "delete")
+                               (cons 'address "0x999000")))
+                        :type 'user-error))
+      (disasm-test--mcp-cleanup session))))
+
+(ert-deftest disasm-test-mcp-breakpoint-requires-stopped ()
+  (let ((session (disasm-test--mcp-session :state 'running)))
+    (unwind-protect
+        (progn
+          (should-error (disasm-mcp--op-breakpoint
+                         (list (cons 'session "4242") (cons 'action "set")
+                               (cons 'address "0x402000")))
+                        :type 'user-error)
+          ;; listing them is always allowed
+          (should (equal (plist-get (disasm-mcp--op-breakpoint
+                                     (list (cons 'session "4242")
+                                           (cons 'action "list")))
+                                    :breakpoints)
+                         [])))
+      (disasm-test--mcp-cleanup session))))
+
+(ert-deftest disasm-test-mcp-step-modes ()
+  (let ((session (disasm-test--mcp-session))
+        (commands nil))
+    (unwind-protect
+        (cl-letf (((symbol-function 'disasm-mi-send)
+                   (lambda (_client cmd callback)
+                     (push cmd commands)
+                     (funcall callback (list :type ?^ :class "done")))))
+          (disasm-mcp--op-step (list (cons 'session "4242") (cons 'mode "in")))
+          (disasm-mcp--op-step (list (cons 'session "4242") (cons 'mode "over")))
+          (disasm-mcp--op-step (list (cons 'session "4242") (cons 'mode "out")))
+          ;; the default is a single step
+          (disasm-mcp--op-step (list (cons 'session "4242")))
+          (should (equal (nreverse commands)
+                         '("-exec-step-instruction" "-exec-next-instruction"
+                           "-exec-finish" "-exec-step-instruction"))))
+      (disasm-test--mcp-cleanup session))))
+
+(ert-deftest disasm-test-mcp-step-unknown-mode ()
+  (let ((session (disasm-test--mcp-session)))
+    (unwind-protect
+        (should-error (disasm-mcp--op-step
+                       (list (cons 'session "4242") (cons 'mode "sideways")))
+                      :type 'user-error)
+      (disasm-test--mcp-cleanup session))))
+
+(ert-deftest disasm-test-mcp-continue-requires-stopped ()
+  (let ((session (disasm-test--mcp-session :state 'running)))
+    (unwind-protect
+        (should-error (disasm-mcp--op-continue (list (cons 'session "4242")))
+                      :type 'user-error)
+      (disasm-test--mcp-cleanup session))))
+
+(ert-deftest disasm-test-mcp-continue-sends-exec-continue ()
+  (let ((session (disasm-test--mcp-session))
+        (command nil))
+    (unwind-protect
+        (cl-letf (((symbol-function 'disasm-mi-send)
+                   (lambda (_client cmd callback)
+                     (setq command cmd)
+                     (funcall callback (list :type ?^ :class "running")))))
+          (disasm-mcp--op-continue (list (cons 'session "4242")))
+          (should (equal command "-exec-continue")))
+      (disasm-test--mcp-cleanup session))))
+
+(ert-deftest disasm-test-mcp-interrupt-when-running ()
+  (let ((session (disasm-test--mcp-session :state 'running :pid 4242)))
+    (unwind-protect
+        (cl-letf (((symbol-function 'disasm-debug-gdb--interrupt-windows) #'ignore))
+          (let ((result (disasm-mcp--op-interrupt (list (cons 'session "4242")))))
+            (should (equal (plist-get result :state) "running"))))
+      (disasm-test--mcp-cleanup session)))
+  ;; interrupting a stopped target just says so
+  (let ((session (disasm-test--mcp-session)))
+    (unwind-protect
+        (let ((result (disasm-mcp--op-interrupt (list (cons 'session "4242")))))
+          (should (plist-get result :note)))
+      (disasm-test--mcp-cleanup session))))
+
+(ert-deftest disasm-test-mcp-goto-moves-the-listing ()
+  (let ((session (disasm-test--mcp-session))
+        (visited nil))
+    (unwind-protect
+        (cl-letf (((symbol-function 'disasm-debug--goto-address)
+                   (lambda (_session address) (setq visited address))))
+          (let ((result (disasm-mcp--op-goto
+                         (list (cons 'session "4242") (cons 'address "0x402005")))))
+            (should (= visited #x402005))
+            (should (= (plist-get result :address) #x402005))))
+      (disasm-test--mcp-cleanup session))))
+
+(ert-deftest disasm-test-mcp-select-thread-and-frame ()
+  (let ((session (disasm-test--mcp-session))
+        (commands nil))
+    (unwind-protect
+        (cl-letf (((symbol-function 'disasm-mi-send)
+                   (lambda (_client cmd callback)
+                     (push cmd commands)
+                     (funcall callback (list :type ?^ :class "done"))))
+                  ((symbol-function 'disasm-debug-gdb-refresh) #'ignore))
+          (disasm-mcp--op-select-thread
+           (list (cons 'session "4242") (cons 'id "2")))
+          (disasm-mcp--op-select-frame
+           (list (cons 'session "4242") (cons 'level 1)))
+          (should (equal (nreverse commands)
+                         '("-thread-select 2" "-stack-select-frame 1")))
+          (should (equal (disasm-debug-session-current-thread session) "2"))
+          (should (= (disasm-debug-session-current-frame session) 1)))
+      (disasm-test--mcp-cleanup session))))
+
+(ert-deftest disasm-test-mcp-select-thread-requires-stopped ()
+  (let ((session (disasm-test--mcp-session :state 'running)))
+    (unwind-protect
+        (should-error (disasm-mcp--op-select-thread
+                       (list (cons 'session "4242") (cons 'id "2")))
+                      :type 'user-error)
+      (disasm-test--mcp-cleanup session))))
+
+(ert-deftest disasm-test-mcp-dispatch-table ()
+  (should (plist-get (disasm-mcp--op-ping nil) :pong))
+  (should (equal (plist-get (disasm-mcp--op-hello nil) :protocol)
+                 disasm-mcp-protocol))
+  (should-error (disasm-mcp--dispatch "no_such_op" nil) :type 'user-error)
+  ;; every name in the table is reachable
+  (dolist (entry disasm-mcp--operations)
+    (should (functionp (cdr entry)))))
+
+;;; M13: the agent log
+
+(ert-deftest disasm-test-mcp-log-records-calls ()
+  (let ((disasm-mcp--log-entries nil)
+        (disasm-mcp--log-buffer nil))
+    (unwind-protect
+        (progn
+          (disasm-mcp--log-call "state" '((session . "7")) '(:state "stopped")
+                                t 0.5 "7" #x401000)
+          (disasm-mcp--log-call "step" nil '(:error "nope") nil 0.1 nil nil)
+          (with-current-buffer (disasm-mcp--log-buffer)
+            (should (= (length disasm-mcp--log-entries) 2))
+            (goto-char (point-min))
+            (should (equal (get-text-property (point) 'disasm-mcp-session) "7"))
+            (should (= (get-text-property (point) 'disasm-mcp-address) #x401000))
+            (should (equal (plist-get (get-text-property (point) 'disasm-mcp-entry) :op)
+                           "state"))
+            ;; the detail line is hidden until TAB is pressed
+            (forward-line 1)
+            (should (eq (get-text-property (point) 'invisible)
+                        'disasm-mcp-log-detail))
+            (should (member 'disasm-mcp-log-detail buffer-invisibility-spec))
+            (disasm-mcp-log-toggle-details)
+            (should-not (member 'disasm-mcp-log-detail buffer-invisibility-spec))
+            (disasm-mcp-log-toggle-details)
+            (should (member 'disasm-mcp-log-detail buffer-invisibility-spec))
+            ;; the failing call is rendered as an error
+            (goto-char (point-max))
+            (forward-line -2)
+            (should (equal (plist-get (get-text-property (point) 'disasm-mcp-entry) :op)
+                           "step"))))
+      (when (buffer-live-p disasm-mcp--log-buffer)
+        (kill-buffer disasm-mcp--log-buffer)))))
+
+(ert-deftest disasm-test-mcp-log-trims-its-length ()
+  (let ((disasm-mcp--log-entries nil)
+        (disasm-mcp--log-buffer nil)
+        (disasm-mcp-log-limit 3))
+    (unwind-protect
+        (progn
+          (dotimes (i 5)
+            (disasm-mcp--log-call (format "op%d" i) nil nil t 0 nil nil))
+          (should (= (length disasm-mcp--log-entries) 3))
+          (with-current-buffer (disasm-mcp--log-buffer)
+            ;; three rows and nothing older left
+            (let ((rows 0))
+              (save-excursion
+                (goto-char (point-min))
+                (while (not (eobp))
+                  (when (get-text-property (point) 'disasm-mcp-log-row)
+                    (setq rows (1+ rows)))
+                  (forward-line 1)))
+              (should (= rows 3)))
+            (goto-char (point-min))
+            (should (equal (plist-get (get-text-property (point) 'disasm-mcp-entry) :op)
+                           "op2"))))
+      (when (buffer-live-p disasm-mcp--log-buffer)
+        (kill-buffer disasm-mcp--log-buffer)))))
+
+(ert-deftest disasm-test-mcp-log-records-events ()
+  (let ((disasm-mcp--log-entries nil)
+        (disasm-mcp--log-buffer nil)
+        (session (disasm-test--mcp-session)))
+    (unwind-protect
+        (progn
+          (disasm-mcp--on-event session
+                                (list :kind 'stopped :reason "breakpoint-hit"
+                                      :breakpoint 2 :thread "1"))
+          (let ((entry (car disasm-mcp--log-entries)))
+            (should (eq (plist-get entry :ok) :event))
+            (should (equal (plist-get entry :kind) "stopped"))
+            (should (string-match-p "reason=breakpoint-hit" (plist-get entry :summary)))
+            (should (string-match-p "bkpt=2" (plist-get entry :summary)))
+            (should (equal (plist-get entry :session) "4242")))
+          (disasm-mcp--on-event session (list :kind 'exited :status "exited normally"))
+          (should (= (length disasm-mcp--log-entries) 2)))
+      (disasm-test--mcp-cleanup session)
+      (when (buffer-live-p disasm-mcp--log-buffer)
+        (kill-buffer disasm-mcp--log-buffer)))))
+
+(ert-deftest disasm-test-mcp-log-goto-needs-an-address ()
+  (let ((disasm-mcp--log-entries nil)
+        (disasm-mcp--log-buffer nil)
+        (visited nil))
+    (unwind-protect
+        (progn
+          (disasm-mcp--log-call "goto" nil (list :address #x401000) t 0 "7" #x401000)
+          (with-current-buffer (disasm-mcp--log-buffer)
+            (goto-char (point-min))
+            (cl-letf (((symbol-function 'disasm-mcp--session-by-id)
+                       (lambda (_id) 'fake-session))
+                      ((symbol-function 'disasm-debug--goto-address)
+                       (lambda (_session address) (setq visited address))))
+              (disasm-mcp-log-goto)
+              (should (= visited #x401000)))
+            ;; an entry without an address refuses politely
+            (forward-line 2)
+            (should-error (disasm-mcp-log-goto) :type 'user-error)))
+      (when (buffer-live-p disasm-mcp--log-buffer)
+        (kill-buffer disasm-mcp--log-buffer)))))
+
+(ert-deftest disasm-test-mcp-log-mode-is-special ()
+  (with-current-buffer (get-buffer-create "*disasm-agent-test*")
+    (disasm-mcp-log-mode)
+    (should (derived-mode-p 'special-mode))
+    (should buffer-read-only)
+    (should (eq (lookup-key (current-local-map) (kbd "RET")) #'disasm-mcp-log-goto))
+    (should (eq (lookup-key (current-local-map) (kbd "TAB"))
+                #'disasm-mcp-log-toggle-details))
+    (should (eq (lookup-key (current-local-map) (kbd "c")) #'disasm-mcp-log-clear))
+    (kill-buffer (current-buffer))))
+
+(ert-deftest disasm-test-mcp-lighter ()
+  (let ((disasm-mcp--server-process nil)
+        (disasm-mcp--clients nil)
+        (disasm-mcp--busy nil)
+        (disasm-mcp--last-op nil))
+    (should (equal (disasm-mcp--lighter) " mcp:off"))
+    (setq disasm-mcp--server-process 'fake)
+    (cl-letf (((symbol-function 'process-live-p) (lambda (_p) t)))
+      (should (equal (disasm-mcp--lighter) " mcp"))
+      (setq disasm-mcp--clients (list 'a))
+      (should (equal (disasm-mcp--lighter) " mcp:1"))
+      (setq disasm-mcp--busy t disasm-mcp--last-op "step")
+      (should (equal (disasm-mcp--lighter) " mcp:step")))))
+
+(ert-deftest disasm-test-mcp-log-key-binding ()
+  (should (eq (lookup-key disasm-prefix-map (kbd "L")) #'disasm-mcp-log)))
+
+;;; M13: the listener protocol
+
+(defun disasm-test--mcp-request (line &optional timeout)
+  "Serve LINE through the endpoint and return the parsed answer.
+The listener must already be running; see `disasm-test--with-listener'."
+  (let* ((client (make-network-process
+                  :name "disasm-test-client" :host "127.0.0.1"
+                  :service disasm-mcp--port :family 'ipv4 :coding 'utf-8-unix
+                  :noquery t))
+         (answer nil)
+         (acc "")
+         (deadline (+ (float-time) (or timeout 5))))
+    (set-process-filter client (lambda (_proc chunk) (setq acc (concat acc chunk))))
+    (unwind-protect
+        (progn
+          (accept-process-output nil 0.05)
+          (process-send-string client (concat line "\n"))
+          (while (and (null answer) (< (float-time) deadline))
+            (accept-process-output nil 0.05)
+            (when (string-match "\n" acc)
+              (setq answer (disasm-mcp--parse-json (substring acc 0 (match-beginning 0)))))))
+      (ignore-errors (delete-process client)))
+    answer))
+
+(defmacro disasm-test--with-listener (&rest body)
+  "Run BODY with the MCP listener up on an ephemeral port.
+`disasm-mcp--token' holds the token to use and `disasm-mcp--port' the
+port it bound."
+  (declare (indent 0))
+  `(let ((disasm-mcp-port t)
+         (disasm-mcp-token-file (make-temp-file "disasm-mcp-token-"))
+         (disasm-mcp--log-entries nil)
+         (disasm-mcp--log-buffer nil)
+         (disasm-mcp--clients nil)
+         (disasm-mcp--queue nil)
+         (disasm-mcp--busy nil))
+     (unwind-protect
+         (progn
+           (disasm-mcp-start)
+           ,@body)
+       (disasm-mcp-stop)
+       (when (buffer-live-p disasm-mcp--log-buffer)
+         (kill-buffer disasm-mcp--log-buffer)))))
+
+(ert-deftest disasm-test-mcp-listener-ping ()
+  (disasm-test--with-listener
+    (should (process-live-p disasm-mcp--server-process))
+    (should (integerp disasm-mcp--port))
+    (let* ((token disasm-mcp--token)
+           (answer (disasm-test--mcp-request
+                    (disasm-mcp--json (list :id 1 :token token :op "ping"
+                                            :args (list))))))
+      (should (eq (alist-get 'ok answer) t))
+      (should (eq (alist-get 'pong (alist-get 'result answer)) t)))))
+
+(ert-deftest disasm-test-mcp-listener-requires-the-token ()
+  (disasm-test--with-listener
+    (let ((answer (disasm-test--mcp-request
+                   (disasm-mcp--json (list :id 2 :token "wrong" :op "sessions"
+                                           :args (list))))))
+      (should (eq (alist-get 'ok answer) :false))
+      (should (equal (alist-get 'kind answer) "auth")))))
+
+(ert-deftest disasm-test-mcp-listener-reports-bad-json ()
+  (disasm-test--with-listener
+    (let ((answer (disasm-test--mcp-request "{not json")))
+      (should (eq (alist-get 'ok answer) :false))
+      (should (equal (alist-get 'kind answer) "protocol")))))
+
+(ert-deftest disasm-test-mcp-listener-rejects-unknown-ops ()
+  (disasm-test--with-listener
+    (let ((answer (disasm-test--mcp-request
+                   (disasm-mcp--json (list :id 3 :token disasm-mcp--token
+                                           :op "take_over_the_world"
+                                           :args (list))))))
+      (should (eq (alist-get 'ok answer) :false))
+      (should (equal (alist-get 'kind answer) "user-error"))
+      (should (string-match-p "Unknown operation" (alist-get 'error answer))))))
+
+(ert-deftest disasm-test-mcp-listener-lists-live-sessions ()
+  (let ((session (disasm-test--mcp-session)))
+    (unwind-protect
+        (with-temp-buffer
+          (setq-local disasm-debug--session session)
+          (disasm-test--with-listener
+            (let* ((answer (disasm-test--mcp-request
+                            (disasm-mcp--json (list :id 4 :token disasm-mcp--token
+                                                    :op "sessions" :args (list)))))
+                   (sessions (alist-get 'sessions (alist-get 'result answer))))
+              (should (= (length sessions) 1))
+              (should (equal (alist-get 'id (nth 0 sessions)) "4242"))
+              (should (equal (alist-get 'state (nth 0 sessions)) "stopped")))))
+      (disasm-test--mcp-cleanup session))))
+
+(ert-deftest disasm-test-mcp-listener-disassembles-over-the-wire ()
+  (let ((session (disasm-test--mcp-session)))
+    (unwind-protect
+        (with-temp-buffer
+          (setq-local disasm-debug--session session)
+          (disasm-test--with-listener
+            (let* ((answer (disasm-test--mcp-request
+                            (disasm-mcp--json
+                             (list :id 5 :token disasm-mcp--token :op "disassemble"
+                                   :args (list :address "0x402000" :count 2)))))
+                   (result (alist-get 'result answer)))
+              (should (eq (alist-get 'ok answer) t))
+              (should (equal (alist-get 'source result) "file"))
+              (should (= (length (alist-get 'instructions result)) 2))
+              ;; the result survives the JSON round trip intact
+              (should (equal (alist-get 'mnemonic
+                                        (nth 1 (alist-get 'instructions result)))
+                             "ret")))))
+      (disasm-test--mcp-cleanup session))))
+
+(ert-deftest disasm-test-mcp-listener-serves-several-requests-in-order ()
+  (let ((session (disasm-test--mcp-session)))
+    (unwind-protect
+        (with-temp-buffer
+          (setq-local disasm-debug--session session)
+          (disasm-test--with-listener
+            (let ((client (make-network-process
+                           :name "disasm-test-pipeline" :host "127.0.0.1"
+                           :service disasm-mcp--port :family 'ipv4
+                           :coding 'utf-8-unix :noquery t))
+                  (acc "")
+                  (answers nil))
+              (set-process-filter
+               client (lambda (_proc chunk) (setq acc (concat acc chunk))))
+              (unwind-protect
+                  (progn
+                    (accept-process-output nil 0.05)
+                    (dotimes (i 3)
+                      (process-send-string
+                       client
+                       (concat (disasm-mcp--json
+                                (list :id (+ 10 i) :token disasm-mcp--token
+                                      :op "state" :args (list))) "\n")))
+                    (let ((deadline (+ (float-time) 5)))
+                      (while (and (< (length answers) 3) (< (float-time) deadline))
+                        (accept-process-output nil 0.05)
+                        (while (string-match "\n" acc)
+                          (let ((line (substring acc 0 (match-beginning 0))))
+                            (setq acc (substring acc (match-end 0)))
+                            (push (disasm-mcp--parse-json line) answers)))))
+                    (setq answers (nreverse answers))
+                    (should (= (length answers) 3))
+                    (should (equal (mapcar (lambda (a) (alist-get 'id a)) answers)
+                                   '(10 11 12)))
+                    (should (equal (alist-get 'state (alist-get 'result (nth 0 answers)))
+                                   "stopped")))
+                (ignore-errors (delete-process client))))))
+      (disasm-test--mcp-cleanup session))))
+
+;;; M13: the event hook
+
+(ert-deftest disasm-test-debug-event-hook-fires-while-stopping ()
+  (let* ((session (disasm-test--mcp-session :state 'running))
+         (events nil))
+    (cl-letf (((symbol-function 'disasm-debug-gdb-refresh) #'ignore)
+              ((symbol-function 'disasm-debug--ui-refresh) #'ignore))
+      (let ((disasm-debug-event-hook
+             (list (lambda (_session event) (push event events)))))
+        (disasm-debug-gdb--on-record
+         session
+         (list :type ?* :class "stopped"
+               :data (list (cons "reason" "breakpoint-hit")
+                           (cons "bkptno" "2")
+                           (cons "thread-id" "1")))
+         nil)
+        (should (= (length events) 1))
+        (should (eq (plist-get (car events) :kind) 'stopped))
+        (should (equal (plist-get (car events) :reason) "breakpoint-hit"))
+        (should (= (plist-get (car events) :breakpoint) 2))
+        (should (equal (plist-get (car events) :thread) "1"))
+        (should (eq (disasm-debug-session-state session) 'stopped))
+        (should (= (disasm-debug-session-hit-breakpoint session) 2))))
+    (disasm-test--mcp-cleanup session)))
+
+(ert-deftest disasm-test-debug-event-hook-fires-while-running ()
+  (let* ((session (disasm-test--mcp-session :state 'stopped))
+         (events nil))
+    (cl-letf (((symbol-function 'disasm-debug--ui-refresh) #'ignore))
+      (let ((disasm-debug-event-hook
+             (list (lambda (_session event) (push event events)))))
+        (disasm-debug-gdb--on-record
+         session (list :type ?* :class "running"
+                       :data (list (cons "thread-id" "1")))
+         nil)
+        (should (eq (plist-get (car events) :kind) 'running))
+        (should (eq (disasm-debug-session-state session) 'running))))
+    (disasm-test--mcp-cleanup session)))
+
+(ert-deftest disasm-test-debug-event-hook-fires-on-thread-group ()
+  (let* ((session (disasm-debug-session--create :state 'connecting :bits 64))
+         (events nil))
+    (let ((disasm-debug-event-hook
+           (list (lambda (_session event) (push event events)))))
+      (disasm-debug-gdb--on-record
+       session
+       (list :type ?= :class "thread-group-started"
+             :data (list (cons "pid" "4242")))
+       nil)
+      (should (eq (plist-get (car events) :kind) 'started))
+      (should (= (plist-get (car events) :pid) 4242))
+      (should (= (disasm-debug-session-pid session) 4242)))))
+
+(ert-deftest disasm-test-debug-event-hook-fires-on-exit ()
+  (let* ((session (disasm-debug-session--create :state 'running :name "t.exe"))
+         (events nil))
+    (cl-letf (((symbol-function 'disasm-debug-pane--refresh) #'ignore))
+      (let ((disasm-debug-event-hook
+             (list (lambda (_session event) (push event events)))))
+        (disasm-debug--on-exit session "exited normally")
+        (should (eq (plist-get (car events) :kind) 'exited))
+        (should (equal (plist-get (car events) :status) "exited normally"))
+        (should (eq (disasm-debug-session-state session) 'exited))))))
+
 (provide 'disasm-tests)
 ;;; disasm-tests.el ends here
