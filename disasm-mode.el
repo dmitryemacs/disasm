@@ -18,6 +18,7 @@
 (require 'disasm-core)
 (require 'disasm-backend)
 (require 'disasm-cache)
+(require 'disasm-outline)
 (require 'xref)
 (require 'subr-x)
 
@@ -106,7 +107,8 @@
       (disasm--render-message
        (format ";;; disassembly failed: %s\n"
                (or (disasm-session-error disasm--session) "unknown error"))))
-     (t (disasm--render-insns)))))
+     (t (disasm--render-insns))))
+  (disasm-outline--refresh disasm--session))
 
 (defun disasm--render-message (text)
   "Replace the buffer contents with the read-only message TEXT."

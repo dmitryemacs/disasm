@@ -96,6 +96,25 @@ Larger files are truncated in the hex pane to keep Emacs responsive."
   :type 'integer
   :group 'disasm)
 
+(defcustom disasm-outline-width 30
+  "Width of the right sidebar (sections/functions) as a percentage.
+Used by the docked layout of `disasm-open'."
+  :type 'integer
+  :group 'disasm)
+
+(defcustom disasm-hex-height 35
+  "Height of the hex pane as a percentage of the left column.
+Used by the docked layout of `disasm-open'."
+  :type 'integer
+  :group 'disasm)
+
+(defcustom disasm-outline-split 40
+  "Height of the sections pane as a percentage of the right sidebar.
+The functions pane fills the rest.  Used by the docked layout of
+`disasm-open'."
+  :type 'integer
+  :group 'disasm)
+
 (defcustom disasm-raw-arch "i386:x86-64"
   "Default architecture passed to objdump for raw (headerless) binaries.
 Used by `disasm-open-raw' together with the \"-b binary\" option."
@@ -201,6 +220,7 @@ The value is passed to objdump as `--adjust-vma'."
   sections insns symbols entry
   show-bytes all-sections
   buffer hex-buffer
+  sections-buffer functions-buffer
   (state 'ready) raw error)
 
 ;;; Helpers
