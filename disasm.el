@@ -62,6 +62,10 @@
     (define-key map (kbd "h") #'disasm-open-hex)
     (define-key map (kbd "s") #'disasm-sync-mode)
     (define-key map (kbd "a") #'disasm-attach)
+    (define-key map (kbd "R") #'disasm-debug-run)
+    (define-key map (kbd "t") #'disasm-debug-toggle-breakpoint)
+    (define-key map (kbd "B") #'disasm-debug-breakpoints)
+    (define-key map (kbd "X") #'disasm-debug-clear-breakpoints)
     (define-key map (kbd "g") #'disasm-debug-goto)
     (define-key map (kbd "f") #'disasm-debug-follow)
     (define-key map (kbd "i") #'disasm-debug-interrupt)
@@ -284,6 +288,7 @@ Detaches from a debugged process first.  Bound to \\`q' in every
   (define-key map (kbd "<f10>") #'disasm-debug-nexti)
   (define-key map (kbd "<f11>") #'disasm-debug-stepi)
   (define-key map (kbd "<S-f11>") #'disasm-debug-finish)
+  (define-key map (kbd "<f2>") #'disasm-debug-toggle-breakpoint)
   (define-key map (kbd "f") #'disasm-debug-follow))
 
 ;; The panes can jump straight to a live address.

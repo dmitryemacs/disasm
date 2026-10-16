@@ -107,6 +107,16 @@ Used when the program counter lies outside the module held in a file."
   "Face marking a listing or pane as live memory rather than a file."
   :group 'disasm)
 
+(defface disasm-debug-breakpoint-face
+  '((t :inherit error :weight bold))
+  "Face marking a line that carries a breakpoint."
+  :group 'disasm)
+
+(defface disasm-debug-breakpoint-hit-face
+  '((t :inherit highlight :weight bold :extend t))
+  "Face marking the breakpoint that most recently stopped the target."
+  :group 'disasm)
+
 ;;; Data structures
 
 (cl-defstruct (disasm-debug-module (:constructor disasm-debug-module--create))
@@ -116,6 +126,12 @@ Used when the program counter lies outside the module held in a file."
 (cl-defstruct (disasm-debug-frame (:constructor disasm-debug-frame--create))
   "A stack frame of the debugged process."
   level addr func file)
+
+(cl-defstruct (disasm-debug-breakpoint (:constructor disasm-debug-breakpoint--create))
+  "A breakpoint set in the debugged process.
+NUMBER is the debugger's identifier, ADDR the live address the breakpoint
+was inserted at and FUNC/FILE/LINE its symbolic location, when known."
+  number addr enabled func file line)
 
 (cl-defstruct (disasm-debug-session (:constructor disasm-debug-session--create))
   "State for one live debugging session."
@@ -129,7 +145,7 @@ Used when the program counter lies outside the module held in a file."
   registers-buffer flags-buffer stack-buffer
   hex-buffer hex-base hex-length
   live-file
-  breakpoints error)
+  breakpoints breakpoints-buffer hit-breakpoint error)
 
 ;;; Helpers
 

@@ -25,9 +25,11 @@
 (require 'disasm-core)
 (require 'disasm-debug-core)
 (require 'disasm-debug-mi)
+(require 'disasm-debug-win)
 
 (declare-function disasm-debug--ui-refresh "disasm-debug" (session))
 (declare-function disasm-debug--on-exit "disasm-debug" (session status))
+(declare-function disasm-debug--rename-listing "disasm-debug" (session))
 
 (defconst disasm-debug-gdb--register-names-64
   '("rax" "rbx" "rcx" "rdx" "rsi" "rdi" "rbp" "rsp"
@@ -133,6 +135,32 @@ Return a plist with :main (image path), :entry (integer), :bits and
                           (or (disasm-mi-field chunk "contents") "")))
                        memory))))))
 
+(defun disasm-debug-gdb--breakpoint (bkpt)
+  "Build a `disasm-debug-breakpoint' from a parsed MI BKPT tuple."
+  (when bkpt
+    (disasm-debug-breakpoint--create
+     :number (string-to-number (or (disasm-mi-field bkpt "number") "0"))
+     :addr (let ((addr (disasm-mi-field bkpt "addr")))
+             (and addr (disasm--hex-to-int addr)))
+     :enabled (not (equal (disasm-mi-field bkpt "enabled") "n"))
+     :func (disasm-mi-field bkpt "func")
+     :file (disasm-mi-field bkpt "file")
+     :line (let ((line (disasm-mi-field bkpt "line")))
+             (and line (string-to-number line))))))
+
+(defun disasm-debug-gdb--breakpoint-from-record (record)
+  "Return the `disasm-debug-breakpoint' described by an insert RECORD, or nil."
+  (disasm-debug-gdb--breakpoint (disasm-mi-field (plist-get record :data) "bkpt")))
+
+(defun disasm-debug-gdb--breakpoints-from-record (record)
+  "Return the list of breakpoints described by a `-break-list' RECORD."
+  (let* ((table (disasm-mi-field (plist-get record :data) "BreakpointTable"))
+         (body (and table (disasm-mi-field table "body"))))
+    (delq nil (mapcar (lambda (entry)
+                        (disasm-debug-gdb--breakpoint
+                         (if (consp entry) (cdr entry) entry)))
+                      (or body (disasm-mi-field table "bkpt"))))))
+
 ;;; Records
 
 (defun disasm-debug-gdb--on-record (session record _token)
@@ -144,11 +172,22 @@ Return a plist with :main (image path), :entry (integer), :bits and
       (setf (disasm-debug-session-capture session)
             (concat (disasm-debug-session-capture session)
                     (or (plist-get record :text) ""))))
+     ((eq type ?=)
+      (pcase (plist-get record :class)
+        ("thread-group-started"
+         (let ((pid (disasm-mi-field (plist-get record :data) "pid")))
+           (when (and pid (null (disasm-debug-session-pid session)))
+             (setf (disasm-debug-session-pid session) (string-to-number pid))
+             (disasm-debug--rename-listing session))))))
      ((eq type ?*)
       (pcase (plist-get record :class)
         ("stopped"
-         (let ((reason (disasm-mi-field (plist-get record :data) "reason")))
+         (let* ((data (plist-get record :data))
+                (reason (disasm-mi-field data "reason"))
+                (bkptno (disasm-mi-field data "bkptno")))
            (setf (disasm-debug-session-reason session) reason)
+           (setf (disasm-debug-session-hit-breakpoint session)
+                 (and bkptno (string-to-number bkptno)))
            (setf (disasm-debug-session-state session)
                  (if (and reason (string-prefix-p "exited" reason))
                      'exited
@@ -277,6 +316,89 @@ Call CALLBACK with the captured text and the final record."
            (setf (disasm-debug-session-pc session) (disasm-debug-frame-addr frame)))))
      (disasm-debug--ui-refresh session))))
 
+;;; Launch
+
+(defun disasm-debug-gdb--quote (string)
+  "Quote STRING as a single MI C-string argument.
+Backslashes and double quotes are escaped with a backslash, so that the
+MI parser recovers STRING unchanged."
+  (concat "\""
+          (mapconcat (lambda (char)
+                       (cond ((eq char ?\\) "\\\\")
+                             ((eq char ?\") "\\\"")
+                             (t (char-to-string char))))
+                     (or string "") "")
+          "\""))
+
+(defun disasm-debug-gdb-load (session file)
+  "Point SESSION's debugger at the executable FILE."
+  (disasm-debug-gdb--send
+   session
+   (format "-file-exec-and-symbols %s" (disasm--file-arg file))))
+
+(defun disasm-debug-gdb-set-directory (session directory)
+  "Make DIRECTORY the working directory of SESSION's target."
+  (disasm-debug-gdb--send
+   session
+   (format "-environment-cd %s" (disasm-debug-gdb--quote directory))))
+
+(defun disasm-debug-gdb-set-arguments (session arguments)
+  "Set the arguments used when SESSION's target is run to ARGUMENTS."
+  (disasm-debug-gdb--send
+   session
+   (format "-exec-arguments %s" (disasm-debug-gdb--quote arguments))))
+
+(defun disasm-debug-gdb-run (session)
+  "Launch SESSION's target and stop at its entry.
+GDB on Windows does not stop at the program entry after a plain
+`-exec-run', so we first plant a temporary breakpoint at `main' and run;
+when no `main' symbol is available we fall back to `starti', which stops
+at the first instruction of the program."
+  (disasm-mi-send
+   (disasm-debug-session-client session)
+   "-break-insert -t main"
+   (lambda (record)
+     (if (equal (plist-get record :class) "done")
+         (disasm-debug-gdb--send session "-exec-run")
+       (disasm-debug-gdb--send session "-interpreter-exec console \"starti\"")))))
+
+;;; Breakpoints
+
+(defun disasm-debug-gdb-break-insert (session address callback)
+  "Insert a breakpoint at the live ADDRESS for SESSION.
+Call CALLBACK with the resulting `disasm-debug-breakpoint', or nil when
+the breakpoint could not be inserted."
+  (if (null address)
+      (progn (message "disasm: no address to set a breakpoint at")
+             (funcall callback nil))
+    (disasm-mi-send
+     (disasm-debug-session-client session)
+     (format "-break-insert *0x%x" address)
+     (lambda (record)
+       (if (equal (plist-get record :class) "done")
+           (funcall callback (disasm-debug-gdb--breakpoint-from-record record))
+         (message "disasm: cannot set a breakpoint at 0x%x: %s" address
+                  (or (disasm-mi-field (plist-get record :data) "msg") "failed"))
+         (funcall callback nil))))))
+
+(defun disasm-debug-gdb-break-delete (session number &optional callback)
+  "Delete the breakpoint NUMBER from SESSION's debugger."
+  (disasm-mi-send
+   (disasm-debug-session-client session)
+   (format "-break-delete %d" number)
+   (lambda (record)
+     (unless (equal (plist-get record :class) "done")
+       (message "disasm: cannot delete breakpoint %d: %s" number
+                (or (disasm-mi-field (plist-get record :data) "msg") "failed")))
+     (when callback (funcall callback (equal (plist-get record :class) "done"))))))
+
+(defun disasm-debug-gdb-break-list (session)
+  "Return the breakpoints currently set in SESSION's debugger.
+This performs a synchronous round trip and therefore requires the target
+to be stopped."
+  (disasm-debug-gdb--breakpoints-from-record
+   (disasm-mi-request (disasm-debug-session-client session) "-break-list")))
+
 ;;; Execution control
 
 (defun disasm-debug-gdb-continue (session)
@@ -295,9 +417,26 @@ Call CALLBACK with the captured text and the final record."
   "Run SESSION's target until the current function returns."
   (disasm-debug-gdb--send session "-exec-finish"))
 
+(defun disasm-debug-gdb--interrupt-windows (session)
+  "Interrupt SESSION's running target on Windows.
+GDB does not read its standard input while the inferior runs, so
+`-exec-interrupt' is useless here.  We instead ask the kernel to inject a
+breakpoint into the target with `DebugBreakProcess'; GDB, being attached,
+observes it and stops.  When the helper is unavailable, fall back to
+signalling the target with `SIGINT' and finally to `-exec-interrupt'."
+  (let ((pid (disasm-debug-session-pid session)))
+    (cond
+     ((and pid (disasm-debug-win-break-process pid)) nil)
+     ((and pid (ignore-errors (zerop (signal-process pid 'SIGINT)))) nil)
+     (t (disasm-debug-gdb--send session "-exec-interrupt")))))
+
 (defun disasm-debug-gdb-interrupt (session)
   "Interrupt SESSION's target."
-  (disasm-debug-gdb--send session "-exec-interrupt"))
+  (if (eq (disasm-debug-session-state session) 'running)
+      (if (eq system-type 'windows-nt)
+          (disasm-debug-gdb--interrupt-windows session)
+        (disasm-debug-gdb--send session "-exec-interrupt"))
+    (message "disasm: the target is not running")))
 
 ;;; Live memory
 

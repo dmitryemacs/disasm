@@ -24,6 +24,7 @@
 (require 'disasm-debug-core)
 
 (declare-function disasm-debug--goto-address "disasm-debug" (session addr))
+(declare-function disasm-debug-delete-breakpoint "disasm-debug" (session breakpoint))
 
 (defvar-local disasm-debug-pane-kind 'registers
   "Which pane this buffer shows: `registers', `flags' or `stack'.")
@@ -57,6 +58,7 @@
     (define-key map (kbd "RET") #'disasm-debug-pane-goto)
     (define-key map (kbd "n") #'disasm-debug-pane-next)
     (define-key map (kbd "p") #'disasm-debug-pane-prev)
+    (define-key map (kbd "d") #'disasm-debug-pane-delete)
     map)
   "Keymap for `disasm-debug-pane-mode'.")
 
@@ -82,7 +84,8 @@
     (pcase kind
       ('registers (setf (disasm-debug-session-registers-buffer session) buffer))
       ('flags (setf (disasm-debug-session-flags-buffer session) buffer))
-      ('stack (setf (disasm-debug-session-stack-buffer session) buffer)))
+      ('stack (setf (disasm-debug-session-stack-buffer session) buffer))
+      ('breakpoints (setf (disasm-debug-session-breakpoints-buffer session) buffer)))
     buffer))
 
 (defun disasm-debug-pane--refresh (session)
@@ -90,7 +93,8 @@
   (when session
     (dolist (buffer (list (disasm-debug-session-registers-buffer session)
                           (disasm-debug-session-flags-buffer session)
-                          (disasm-debug-session-stack-buffer session)))
+                          (disasm-debug-session-stack-buffer session)
+                          (disasm-debug-session-breakpoints-buffer session)))
       (when (buffer-live-p buffer)
         (with-current-buffer buffer
           (let ((line (line-number-at-pos)))
@@ -111,7 +115,8 @@
     (pcase disasm-debug-pane-kind
       ('registers (disasm-debug-pane--render-registers session))
       ('flags (disasm-debug-pane--render-flags session))
-      ('stack (disasm-debug-pane--render-stack session)))
+      ('stack (disasm-debug-pane--render-stack session))
+      ('breakpoints (disasm-debug-pane--render-breakpoints session)))
     (goto-char (point-min))))
 
 (defun disasm-debug-pane--register-order (session)
@@ -209,6 +214,51 @@
                    'help-echo "mouse-1: show this frame in the listing")))
           (insert "\n"))))))
 
+(defun disasm-debug-pane--render-breakpoints (session)
+  "Render SESSION's breakpoints into the current buffer."
+  (disasm-debug-pane--insert-title "breakpoints")
+  (let ((breakpoints (disasm-debug-session-breakpoints session))
+        (bits (or (disasm-debug-session-bits session) 64))
+        (hit (disasm-debug-session-hit-breakpoint session))
+        (stopped (eq (disasm-debug-session-state session) 'stopped)))
+    (if (null breakpoints)
+        (insert (propertize (format "%s\n" (disasm-debug-pane--empty-text session))
+                            'face 'disasm-comment-face))
+      (dolist (bp breakpoints)
+        (let* ((number (disasm-debug-breakpoint-number bp))
+               (addr (disasm-debug-breakpoint-addr bp))
+               (enabled (disasm-debug-breakpoint-enabled bp))
+               (current (and stopped (eql number hit)))
+               (start (point)))
+          (insert (propertize (format "%s%-3d " (if current ">" " ") number)
+                              'face (if current
+                                        'disasm-debug-breakpoint-hit-face
+                                      'disasm-comment-face)))
+          (when addr
+            (insert (propertize (disasm--format-address addr bits)
+                                'face 'disasm-address-face)))
+          (insert "  ")
+          (insert (propertize (or (disasm-debug-breakpoint-func bp)
+                                  (and (disasm-debug-breakpoint-file bp)
+                                       (format "%s:%s"
+                                               (file-name-nondirectory
+                                                (disasm-debug-breakpoint-file bp))
+                                               (disasm-debug-breakpoint-line bp)))
+                                  "")
+                              'face 'disasm-symbol-face))
+          (unless enabled
+            (insert (propertize "  (disabled)" 'face 'disasm-comment-face)))
+          (when (and addr (not current))
+            (add-text-properties
+             start (line-end-position)
+             (list 'disasm-debug-addr addr
+                   'mouse-face 'highlight
+                   'local-map disasm-debug-pane-entry-map
+                   'help-echo "mouse-1: show this breakpoint in the listing")))
+          (add-text-properties start (line-end-position)
+                               (list 'disasm-debug-breakpoint number))
+          (insert "\n"))))))
+
 (defun disasm-debug-pane--empty-text (session)
   "Return a placeholder line for an empty pane of SESSION."
   (pcase (disasm-debug-session-state session)
@@ -275,6 +325,23 @@
           (setq found t)
         (forward-line -1)))
     (unless found (goto-char start))))
+
+(defun disasm-debug-pane--breakpoint-at-point ()
+  "Return the breakpoint number on the current pane line, or nil."
+  (get-text-property (line-beginning-position) 'disasm-debug-breakpoint))
+
+(defun disasm-debug-pane-delete ()
+  "Delete the breakpoint shown on the current line."
+  (interactive)
+  (unless (eq disasm-debug-pane-kind 'breakpoints)
+    (user-error "Not in the breakpoints pane"))
+  (let ((number (disasm-debug-pane--breakpoint-at-point)))
+    (unless number (user-error "No breakpoint on this line"))
+    (let ((bp (cl-find number (disasm-debug-session-breakpoints
+                               disasm-debug-pane-session)
+                       :key #'disasm-debug-breakpoint-number)))
+      (unless bp (user-error "No such breakpoint"))
+      (disasm-debug-delete-breakpoint disasm-debug-pane-session bp))))
 
 ;;; Mode
 

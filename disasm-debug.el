@@ -54,8 +54,14 @@
 (defvar-local disasm-debug--pc-overlay nil
   "Overlay marking the program counter in this listing buffer.")
 
+(defvar-local disasm-debug--breakpoint-overlays nil
+  "Overlays marking breakpoints in this listing buffer.")
+
 (defvar-local disasm-debug--laid-out nil
   "Non-nil once the debug layout has been built for this buffer.")
+
+(define-fringe-bitmap 'disasm-debug-breakpoint
+  [60 126 255 255 255 126 60] nil nil 'center)
 
 (defun disasm-debug--current-session ()
   "Return the debug session of the current buffer, or signal an error."
@@ -213,7 +219,39 @@ Also refreshes the live hex pane, which follows the listing."
             (setq disasm-debug--pc-overlay
                   (make-overlay (line-beginning-position) (line-end-position)))
             (overlay-put disasm-debug--pc-overlay 'face 'disasm-debug-pc-face)
-            (overlay-put disasm-debug--pc-overlay 'priority 10)))))))
+            (overlay-put disasm-debug--pc-overlay 'priority 10)))))
+    (disasm-debug--refresh-breakpoint-overlays session)))
+
+;;; Breakpoint markers
+
+(defun disasm-debug--refresh-breakpoint-overlays (session)
+  "Re-draw the breakpoint markers in SESSION's listing buffer."
+  (let ((listing (disasm-debug-session-listing session)))
+    (when (buffer-live-p listing)
+      (with-current-buffer listing
+        (mapc #'delete-overlay disasm-debug--breakpoint-overlays)
+        (setq disasm-debug--breakpoint-overlays nil)
+        (let ((dsession disasm--session))
+          (when (and dsession (eq (disasm-session-state dsession) 'ready))
+            (dolist (bp (disasm-debug-session-breakpoints session))
+              (let* ((file-addr (disasm-debug--live-to-file
+                                 session (disasm-debug-breakpoint-addr bp)))
+                     (idx (disasm-session-insn-index-exact dsession file-addr)))
+                (when idx
+                  (let ((insn (aref (disasm-session-insns dsession) idx)))
+                    (save-excursion
+                      (goto-char (point-min))
+                      (forward-line (1- (disasm-insn-line insn)))
+                      (let ((ov (make-overlay (line-beginning-position)
+                                              (line-end-position))))
+                        (overlay-put ov 'face 'disasm-debug-breakpoint-face)
+                        (overlay-put ov 'priority 5)
+                        (overlay-put
+                         ov 'before-string
+                         (propertize " " 'display
+                                     '(left-fringe disasm-debug-breakpoint
+                                                   disasm-debug-breakpoint-face)))
+                        (push ov disasm-debug--breakpoint-overlays)))))))))))))
 
 ;;; Showing an address in the listing
 
@@ -277,6 +315,27 @@ Also refreshes the live hex pane, which follows the listing."
    :file (or (disasm-debug-session-name session) "")
    :format "" :arch "" :bits 64 :backend disasm-backend
    :insns [] :state 'loading))
+
+(defun disasm-debug--rename-listing (session)
+  "Rename SESSION's listing buffer once its process id is known."
+  (let ((listing (disasm-debug-session-listing session)))
+    (when (buffer-live-p listing)
+      (with-current-buffer listing
+        (rename-buffer (disasm-debug--listing-name session) t)))))
+
+(defun disasm-debug--prepare-session (session)
+  "Create and initialize the listing buffer for SESSION.  Return it."
+  (let ((listing (get-buffer-create (disasm-debug--listing-name session))))
+    (with-current-buffer listing
+      (disasm-mode)
+      (setq-local disasm--session (disasm-debug--placeholder-session session))
+      (setq-local disasm-debug--session session)
+      (setq-local disasm-debug--pc-overlay nil)
+      (setq-local disasm-debug--breakpoint-overlays nil)
+      (setq-local disasm-debug--laid-out nil)
+      (disasm-render))
+    (setf (disasm-debug-session-listing session) listing)
+    listing))
 
 (defun disasm-debug--ensure-layout (session)
   "Build the debug layout for SESSION the first time it is refreshed."
@@ -465,20 +524,12 @@ Also refreshes the live hex pane, which follows the listing."
   "Attach to a running process and debug it.
 ENTRY is a `disasm-proc-entry' chosen from the process list."
   (interactive (list (disasm-proc-read)))
-  (let* ((session (disasm-debug-session--create
-                   :backend disasm-debug-backend
-                   :pid (disasm-proc-entry-pid entry)
-                   :name (disasm-proc-entry-name entry)
-                   :state 'connecting))
-         (listing (get-buffer-create (disasm-debug--listing-name session))))
-    (with-current-buffer listing
-      (disasm-mode)
-      (setq-local disasm--session (disasm-debug--placeholder-session session))
-      (setq-local disasm-debug--session session)
-      (setq-local disasm-debug--pc-overlay nil)
-      (setq-local disasm-debug--laid-out nil)
-      (disasm-render))
-    (setf (disasm-debug-session-listing session) listing)
+  (let ((session (disasm-debug-session--create
+                  :backend disasm-debug-backend
+                  :pid (disasm-proc-entry-pid entry)
+                  :name (disasm-proc-entry-name entry)
+                  :state 'connecting)))
+    (disasm-debug--prepare-session session)
     (message "Attaching to %s (%d) ..."
              (disasm-debug-session-name session)
              (disasm-debug-session-pid session))
@@ -490,10 +541,41 @@ ENTRY is a `disasm-proc-entry' chosen from the process list."
                      (disasm-debug-session-backend session))))
     session))
 
+;;;###autoload
+(defun disasm-debug-run (file arguments)
+  "Run FILE under the debugger with ARGUMENTS.
+The program is started from scratch, stopped at its entry point and can
+then be debugged like an attached process."
+  (interactive
+   (list (read-file-name "Run under the debugger: " nil nil t)
+         (read-string "Program arguments: ")))
+  (let* ((file (expand-file-name file))
+         (session (disasm-debug-session--create
+                   :backend disasm-debug-backend
+                   :name (file-name-nondirectory file)
+                   :exe file
+                   :state 'connecting)))
+    (disasm-debug--prepare-session session)
+    (message "Starting %s under the debugger ..."
+             (disasm-debug-session-name session))
+    (pcase (disasm-debug-session-backend session)
+      ('gdb-mi
+       (disasm-debug-gdb-start session)
+       (disasm-debug-gdb-load session file)
+       (disasm-debug-gdb-set-directory session (file-name-directory file))
+       (disasm-debug-gdb-set-arguments session arguments)
+       (disasm-debug-gdb-run session))
+      (_ (user-error "Unknown debugger backend: %s"
+                     (disasm-debug-session-backend session))))
+    session))
+
 (defun disasm-debug-detach (session)
   "Detach SESSION's debugger from its target."
   (interactive (list (disasm-debug--current-session)))
   (setf (disasm-debug-session-state session) 'detached)
+  (setf (disasm-debug-session-breakpoints session) nil)
+  (setf (disasm-debug-session-hit-breakpoint session) nil)
+  (disasm-debug--refresh-breakpoint-overlays session)
   (when (disasm-debug-session-live-file session)
     (ignore-errors (delete-file (disasm-debug-session-live-file session)))
     (setf (disasm-debug-session-live-file session) nil))
@@ -533,9 +615,104 @@ asynchronous `*running' or `*stopped' event."
   (disasm-debug--run 'finish))
 
 (defun disasm-debug-interrupt ()
-  "Interrupt the running debugged process."
+  "Interrupt the running debugged process (C-c d i)."
   (interactive)
   (disasm-debug--run 'interrupt))
+
+;;; Breakpoints
+
+(defun disasm-debug--break-insert (session address callback)
+  "Insert a breakpoint at ADDRESS for SESSION and call CALLBACK with it."
+  (pcase (disasm-debug-session-backend session)
+    ('gdb-mi (disasm-debug-gdb-break-insert session address callback))))
+
+(defun disasm-debug--break-delete (session number &optional callback)
+  "Delete the breakpoint NUMBER from SESSION's debugger."
+  (pcase (disasm-debug-session-backend session)
+    ('gdb-mi (disasm-debug-gdb-break-delete session number callback))))
+
+(defun disasm-debug--breakpoint-at (session address)
+  "Return the breakpoint of SESSION set at live ADDRESS, or nil."
+  (cl-find-if (lambda (bp) (eql (disasm-debug-breakpoint-addr bp) address))
+              (disasm-debug-session-breakpoints session)))
+
+(defun disasm-debug-delete-breakpoint (session breakpoint)
+  "Delete BREAKPOINT of SESSION."
+  (unless (memq (disasm-debug-session-state session) '(stopped))
+    (user-error "The target must be stopped to change breakpoints"))
+  (disasm-debug--break-delete
+   session (disasm-debug-breakpoint-number breakpoint)
+   (lambda (_ok)
+     (setf (disasm-debug-session-breakpoints session)
+           (delq breakpoint (disasm-debug-session-breakpoints session)))
+     (disasm-debug--after-breakpoint-change session)
+     (message "disasm: breakpoint %d deleted"
+              (disasm-debug-breakpoint-number breakpoint)))))
+
+(defun disasm-debug--after-breakpoint-change (session)
+  "Refresh SESSION's listing markers and state panes after a change."
+  (disasm-debug--refresh-breakpoint-overlays session)
+  (disasm-debug-pane--refresh session))
+
+(defun disasm-debug-toggle-breakpoint-at (session address)
+  "Set or clear a breakpoint at live ADDRESS in SESSION."
+  (unless (eq (disasm-debug-session-state session) 'stopped)
+    (user-error "The target must be stopped to change breakpoints"))
+  (let ((existing (disasm-debug--breakpoint-at session address)))
+    (if existing
+        (disasm-debug-delete-breakpoint session existing)
+      (disasm-debug--break-insert
+       session address
+       (lambda (bp)
+         (when bp
+           (setf (disasm-debug-session-breakpoints session)
+                 (append (disasm-debug-session-breakpoints session) (list bp)))
+           (disasm-debug--after-breakpoint-change session)
+           (message "disasm: breakpoint %d at %s"
+                    (disasm-debug-breakpoint-number bp)
+                    (disasm--format-address
+                     address (or (disasm-debug-session-bits session) 64)))))))))
+
+(defun disasm-debug-toggle-breakpoint ()
+  "Set or clear a breakpoint at point (F2 / C-c d t).
+In the listing the instruction at point is used, in a state pane the
+address on the current line."
+  (interactive)
+  (let ((session (disasm-debug--current-session)))
+    (cond
+     ((derived-mode-p 'disasm-debug-pane-mode)
+      (let ((addr (disasm-debug-pane--address-at-point)))
+        (unless addr (user-error "No address on this line"))
+        (disasm-debug-toggle-breakpoint-at session addr)))
+     ((derived-mode-p 'disasm-mode)
+      (let ((addr (disasm-debug--listing-live-address session)))
+        (unless addr (user-error "No instruction at point"))
+        (disasm-debug-toggle-breakpoint-at session addr)))
+     (t (user-error "Not in a debugging buffer")))))
+
+(defun disasm-debug-clear-breakpoints ()
+  "Delete all breakpoints of the current session (C-c d X)."
+  (interactive)
+  (let* ((session (disasm-debug--current-session))
+         (breakpoints (disasm-debug-session-breakpoints session)))
+    (unless (eq (disasm-debug-session-state session) 'stopped)
+      (user-error "The target must be stopped to change breakpoints"))
+    (if (null breakpoints)
+        (message "disasm: no breakpoints to clear")
+      (dolist (bp breakpoints)
+        (disasm-debug--break-delete session (disasm-debug-breakpoint-number bp)))
+      (setf (disasm-debug-session-breakpoints session) nil)
+      (disasm-debug--after-breakpoint-change session)
+      (message "disasm: cleared %d breakpoint%s"
+               (length breakpoints)
+               (if (= 1 (length breakpoints)) "" "s")))))
+
+(defun disasm-debug-breakpoints ()
+  "Show the breakpoints of the current session (C-c d B)."
+  (interactive)
+  (let* ((session (disasm-debug--current-session))
+         (buffer (disasm-debug-pane--get-buffer session 'breakpoints)))
+    (pop-to-buffer buffer)))
 
 (defun disasm-debug--goto-address (session addr)
   "Show the live address ADDR in SESSION's listing."
@@ -615,6 +792,7 @@ this falls back to `forward-char'."
                   (disasm-debug-session-registers-buffer session)
                   (disasm-debug-session-flags-buffer session)
                   (disasm-debug-session-stack-buffer session)
+                  (disasm-debug-session-breakpoints-buffer session)
                   (disasm-debug-session-hex-buffer session))))
 
 (provide 'disasm-debug)
