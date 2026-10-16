@@ -780,6 +780,141 @@
                        (disasm-session-functions-buffer session)))
         (when (buffer-live-p b) (kill-buffer b))))))
 
+;;; Layouts: taking over the frame
+
+(ert-deftest disasm-test-collapse-default ()
+  (should (eq (default-value 'disasm-collapse-other-windows) t)))
+
+(ert-deftest disasm-test-collapse-other-windows ()
+  (save-window-excursion
+    (let* ((keep (selected-window))
+           (other (generate-new-buffer " *disasm-other*"))
+           (extra (generate-new-buffer " *disasm-extra*")))
+      (unwind-protect
+          (progn
+            (set-window-buffer keep other)
+            (set-window-buffer (split-window keep) extra)
+            (should (>= (length (window-list)) 2))
+            ;; When enabled, `keep' becomes the only window.
+            (let ((disasm-collapse-other-windows t))
+              (disasm--collapse-other-windows keep))
+            (should (= (length (window-list)) 1))
+            (should (eq (window-buffer keep) other))
+            ;; When disabled, the split is left alone.
+            (set-window-buffer (split-window keep) extra)
+            (should (>= (length (window-list)) 2))
+            (let ((disasm-collapse-other-windows nil))
+              (disasm--collapse-other-windows keep))
+            (should (>= (length (window-list)) 2)))
+        (kill-buffer other)
+        (kill-buffer extra)))))
+
+(ert-deftest disasm-test-debug-layout-collapses-windows ()
+  (save-window-excursion
+    (let* ((session (disasm-debug-session--create
+                     :backend 'gdb-mi :state 'stopped :bits 64
+                     :name "t" :pid 1))
+           (foreign (generate-new-buffer " *disasm-foreign*"))
+           (listing (disasm-debug--prepare-session session)))
+      (unwind-protect
+          (progn
+            ;; An unrelated window that must be collapsed away.
+            (set-window-buffer (split-window) foreign)
+            (should (>= (length (window-list)) 2))
+            (cl-letf (((symbol-function 'disasm-debug--set-drivers) #'ignore)
+                      ((symbol-function 'disasm-sync-mode) #'ignore)
+                      ((symbol-function 'disasm-sync--tick) #'ignore))
+              (disasm-debug--ensure-layout session))
+            (let ((buffers (mapcar #'window-buffer (window-list))))
+              ;; listing + hex + registers + flags + stack, nothing else
+              (should (= (length buffers) 5))
+              (should (memq listing buffers))
+              (should-not (memq foreign buffers))))
+        (dolist (b (list (disasm-debug-session-registers-buffer session)
+                         (disasm-debug-session-flags-buffer session)
+                         (disasm-debug-session-stack-buffer session)
+                         (disasm-debug-session-hex-buffer session)
+                         listing foreign))
+          (when (buffer-live-p b) (kill-buffer b)))))))
+
+(ert-deftest disasm-test-docked-layout-collapses-windows ()
+  (let* ((file (disasm-test--write-bytes (number-sequence 0 39)))
+         (session (disasm-session--create
+                   :file file :bits 64
+                   :sections (list disasm-test--code-section)))
+         (dbuf (generate-new-buffer " *disasm-list*"))
+         (foreign (generate-new-buffer " *disasm-foreign*")))
+    (unwind-protect
+        (save-window-excursion
+          (setf (disasm-session-buffer session) dbuf)
+          ;; An unrelated window that must be collapsed away.
+          (set-window-buffer (split-window) foreign)
+          (should (>= (length (window-list)) 2))
+          (disasm--open-docked session dbuf)
+          (let ((buffers (mapcar #'window-buffer (window-list))))
+            ;; listing + sections + functions + hex, nothing else
+            (should (= (length buffers) 4))
+            (should (memq dbuf buffers))
+            (should-not (memq foreign buffers))))
+      (kill-buffer dbuf)
+      (kill-buffer foreign)
+      (delete-file file)
+      (dolist (b (list (disasm-session-sections-buffer session)
+                       (disasm-session-functions-buffer session)
+                       (disasm-session-hex-buffer session)))
+        (when (buffer-live-p b) (kill-buffer b))))))
+
+(ert-deftest disasm-test-open-single-pane-collapses-windows ()
+  (let* ((file (disasm-test--write-bytes (number-sequence 0 39)))
+         (foreign (generate-new-buffer " *disasm-foreign*"))
+         (buf nil))
+    (unwind-protect
+        (save-window-excursion
+          (let ((session (disasm-session--create
+                          :file file :bits 64 :state 'loading
+                          :sections (list disasm-test--code-section))))
+            (set-window-buffer (split-window) foreign)
+            (should (>= (length (window-list)) 2))
+            ;; `disasm--open' runs objdump; keep the test hermetic.
+            (setq buf (cl-letf (((symbol-function 'disasm--build-session)
+                                 (lambda (&rest _) session))
+                                ((symbol-function 'disasm--begin-disassembly)
+                                 #'ignore))
+                       (disasm--open file)))
+            (let ((buffers (mapcar #'window-buffer (window-list))))
+              (should (= (length buffers) 1))
+              (should (memq buf buffers))
+              (should-not (memq foreign buffers)))))
+      (kill-buffer foreign)
+      (when (buffer-live-p buf) (kill-buffer buf))
+      (delete-file file))))
+
+(ert-deftest disasm-test-open-hex-pane-collapses-windows ()
+  (let* ((file (disasm-test--write-bytes (number-sequence 0 39)))
+         (session (disasm-session--create
+                   :file file :bits 64 :state 'ready
+                   :sections (list disasm-test--code-section)))
+         (dbuf (generate-new-buffer " *disasm-list*"))
+         (foreign (generate-new-buffer " *disasm-foreign*")))
+    (unwind-protect
+        (save-window-excursion
+          (setf (disasm-session-buffer session) dbuf)
+          (set-window-buffer (split-window) foreign)
+          (should (>= (length (window-list)) 2))
+          (cl-letf (((symbol-function 'disasm-sync-mode) #'ignore)
+                    ((symbol-function 'disasm-sync--tick) #'ignore))
+            (disasm--open-hex-pane session dbuf))
+          (let ((buffers (mapcar #'window-buffer (window-list))))
+            ;; listing + hex, nothing else
+            (should (= (length buffers) 2))
+            (should (memq dbuf buffers))
+            (should-not (memq foreign buffers))))
+      (kill-buffer dbuf)
+      (kill-buffer foreign)
+      (delete-file file)
+      (when (buffer-live-p (disasm-session-hex-buffer session))
+        (kill-buffer (disasm-session-hex-buffer session))))))
+
 ;;; GDB/MI parser
 
 (ert-deftest disasm-test-mi-parse-done-value ()
