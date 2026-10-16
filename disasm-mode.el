@@ -16,7 +16,7 @@
 ;;; Code:
 
 (require 'disasm-core)
-(require 'disasm-objdump)
+(require 'disasm-backend)
 (require 'disasm-cache)
 (require 'xref)
 (require 'subr-x)
@@ -339,7 +339,7 @@ Unless FORCE is non-nil, a cached result is reused when available."
           (with-current-buffer buffer
             (disasm-render)
             (disasm--sync-if-available)))
-        (disasm-objdump-disassemble-async
+        (disasm-backend-disassemble-async
          (disasm-session-file session)
          (disasm-session-sections session)
          (disasm-session-all-sections session)
@@ -356,7 +356,8 @@ Unless FORCE is non-nil, a cached result is reused when available."
                      (disasm--sync-if-available))
                  (setf (disasm-session-state session) 'error)
                  (setf (disasm-session-error session)
-                       (format "objdump exited with status %s" status))
+                       (format "%s exited with status %s"
+                               (disasm-backend-name) status))
                  (disasm-render)
                  (disasm--sync-if-available)))))))))))
 

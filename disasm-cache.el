@@ -49,7 +49,8 @@ objdump output."
           (and attrs (file-attribute-size attrs))
           (and attrs (file-attribute-modification-time attrs))
           disasm-backend disasm-syntax disasm-demangle
-          disasm-objdump-extra-args all-sections raw)))
+          disasm-objdump-extra-args disasm-llvm-objdump-extra-args
+          all-sections raw)))
 
 (defun disasm-cache-get (key)
   "Return the cached value for KEY, or nil."

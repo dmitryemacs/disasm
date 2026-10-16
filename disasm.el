@@ -45,7 +45,8 @@
 ;;; Code:
 
 (require 'disasm-core)
-(require 'disasm-objdump)
+(require 'disasm-backend)
+(require 'disasm-image)
 (require 'disasm-cache)
 (require 'disasm-mode)
 (require 'disasm-hex)
@@ -73,12 +74,24 @@
   (format "*disasm: %s*" (file-name-nondirectory file)))
 
 (defun disasm--build-session (file &optional raw)
-  "Run objdump over FILE's header and sections and return a `disasm-session'.
+  "Read FILE's header and sections and return a `disasm-session'.
 The (slow) disassembly itself is not run here; the returned session has
 state `loading' and is filled in asynchronously.  When RAW is non-nil,
 FILE is treated as a headerless binary."
-  (let* ((header (disasm-objdump-header file raw))
-         (sections (disasm-objdump-sections file raw)))
+  (let* ((header (disasm-backend-header file raw))
+         (sections (disasm-backend-sections file raw))
+         (image (unless raw (disasm-image-info file)))
+         (entry (plist-get header :entry)))
+    ;; llvm-objdump's section table has no file offsets; recover them from
+    ;; the PE/ELF container so the hex pane can stay in sync.
+    (when image
+      (disasm-image-fill-offsets image sections))
+    ;; llvm-objdump reports no entry point for PE files; fall back to the
+    ;; value read from the container header.
+    (let ((image-entry (and image (plist-get image :entry))))
+      (when (or (null entry) (zerop entry))
+        (when (and image-entry (not (zerop image-entry)))
+          (setq entry image-entry))))
     (disasm-session--create
      :file file
      :format (plist-get header :format)
@@ -88,7 +101,7 @@ FILE is treated as a headerless binary."
      :sections sections
      :insns []
      :symbols nil
-     :entry (plist-get header :entry)
+     :entry entry
      :show-bytes disasm-show-bytes
      :all-sections (or raw disasm-disassemble-all)
      :raw raw
@@ -100,8 +113,9 @@ When TWO-PANE is non-nil, also open a synchronized hex pane.
 When RAW is non-nil, treat FILE as a headerless binary."
   (unless (file-regular-p file)
     (user-error "Not a regular file: %s" file))
-  (when (eq disasm-backend 'llvm-objdump)
-    (user-error "The llvm-objdump backend is not implemented yet"))
+  (when (and raw (not (disasm-backend-supports-raw-p)))
+    (user-error "The %s backend cannot disassemble raw binaries"
+                (disasm-backend-name)))
   (message "Disassembling %s..." file)
   (let* ((session (disasm--build-session file raw))
          (buffer (get-buffer-create (disasm--buffer-name file))))
