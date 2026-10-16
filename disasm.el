@@ -50,6 +50,7 @@
 (require 'disasm-cache)
 (require 'disasm-mode)
 (require 'disasm-hex)
+(require 'disasm-outline)
 
 (defvar disasm-prefix-map
   (let ((map (make-sparse-keymap)))
@@ -109,7 +110,8 @@ FILE is treated as a headerless binary."
 
 (defun disasm--open (file &optional two-pane raw)
   "Disassemble FILE and display the result.
-When TWO-PANE is non-nil, also open a synchronized hex pane.
+When TWO-PANE is non-nil, use the docked layout: the hex pane below the
+listing and the section/function sidebars in a right-hand column.
 When RAW is non-nil, treat FILE as a headerless binary."
   (unless (file-regular-p file)
     (user-error "Not a regular file: %s" file))
@@ -125,14 +127,54 @@ When RAW is non-nil, treat FILE as a headerless binary."
       (setf (disasm-session-buffer session) buffer)
       (disasm-render))
     (if two-pane
-        (disasm--open-two-pane session buffer)
+        (disasm--open-docked session buffer)
       (pop-to-buffer buffer))
     (disasm--begin-disassembly session buffer
                                (disasm-session-entry session))
     buffer))
 
-(defun disasm--open-two-pane (session buffer)
-  "Display SESSION's BUFFER with a hex pane on the left."
+(defun disasm--split-fraction (window fraction side)
+  "Split WINDOW on SIDE, giving the new window FRACTION of its size.
+FRACTION is a number between 0 and 1.  `split-window' interprets a
+positive SIZE as the size the *original* window keeps, so we convert."
+  (let* ((horizontal (memq side '(left right)))
+         (total (if horizontal (window-width window) (window-height window)))
+         (new (max 1 (round (* total fraction))))
+         (keep (max 1 (- total new))))
+    (split-window window keep side)))
+
+(defun disasm--open-docked (session buffer)
+  "Display SESSION's listing BUFFER in the docked, x64dbg-like layout.
+The right column stacks the sections and functions sidebars; the hex
+pane sits below the listing in the left column."
+  (let ((hexbuf (disasm-hex--get-buffer session))
+        (secbuf (disasm-outline--get-buffer session 'sections))
+        (fnbuf (disasm-outline--get-buffer session 'functions)))
+    (pop-to-buffer buffer)
+    (let* ((disasm-win (or (get-buffer-window buffer) (selected-window)))
+           ;; Right column: sections on top, functions below.
+           (outwin (disasm--split-fraction disasm-win
+                                           (/ disasm-outline-width 100.0)
+                                           'right))
+           (fnwin (disasm--split-fraction outwin
+                                          (- 1 (/ disasm-outline-split 100.0))
+                                          'below)))
+      (set-window-buffer outwin secbuf)
+      (set-window-buffer fnwin fnbuf)
+      ;; Left column: the hex pane below the listing.
+      (let ((hexwin (disasm--split-fraction disasm-win
+                                            (/ disasm-hex-height 100.0)
+                                            'below)))
+        (set-window-buffer hexwin hexbuf))
+      (select-window disasm-win))
+    (disasm-sync-mode 1)
+    (disasm-sync--tick)
+    buffer))
+
+(defun disasm--open-hex-pane (session buffer)
+  "Display SESSION's BUFFER with a hex pane on the left.
+Used by `disasm-open-hex', which also works for listings opened as a
+single pane."
   (let ((hexbuf (disasm-hex--get-buffer session)))
     (pop-to-buffer buffer)
     (let* ((disasm-win (or (get-buffer-window buffer) (selected-window)))
@@ -151,7 +193,9 @@ When RAW is non-nil, treat FILE as a headerless binary."
 
 ;;;###autoload
 (defun disasm-open (file)
-  "Disassemble FILE and show a synchronized hex pane next to the listing."
+  "Disassemble FILE and show it in the docked layout.
+The listing sits at the top-left with a synchronized hex pane below it;
+the binary's sections and functions fill a right-hand column."
   (interactive (list (read-file-name "Disassemble file: " nil nil t)))
   (disasm--open (expand-file-name file) t))
 
@@ -179,7 +223,7 @@ assumed to live at."
     (user-error "Not a disasm listing buffer"))
   (unless disasm--session
     (user-error "No disasm session in this buffer"))
-  (disasm--open-two-pane disasm--session (current-buffer)))
+  (disasm--open-hex-pane disasm--session (current-buffer)))
 
 ;;;###autoload
 (defun disasm-buffer ()
