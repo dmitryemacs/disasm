@@ -51,6 +51,7 @@
 (require 'disasm-mode)
 (require 'disasm-hex)
 (require 'disasm-outline)
+(require 'disasm-debug)
 
 (defvar disasm-prefix-map
   (let ((map (make-sparse-keymap)))
@@ -60,6 +61,8 @@
     (define-key map (kbd "r") #'disasm-open-raw)
     (define-key map (kbd "h") #'disasm-open-hex)
     (define-key map (kbd "s") #'disasm-sync-mode)
+    (define-key map (kbd "a") #'disasm-attach)
+    (define-key map (kbd "i") #'disasm-debug-interrupt)
     (define-key map (kbd "c") #'disasm-cache-clear)
     map)
   "Command prefix map for `disasm', bound to \"C-c d\".")
@@ -242,17 +245,24 @@ assumed to live at."
 
 (defun disasm-quit ()
   "Close the current session's listing, hex and sidebar buffers.
-Bound to \\`q' in every `disasm' buffer."
+Detaches from a debugged process first.  Bound to \\`q' in every
+`disasm' buffer."
   (interactive)
-  (let ((session disasm--session)
-        (buffers nil))
+  (let* ((debug (cond ((bound-and-true-p disasm-debug--session) disasm-debug--session)
+                      ((bound-and-true-p disasm-debug-pane-session) disasm-debug-pane-session)))
+         (session disasm--session)
+         (buffers nil))
+    (when debug
+      (ignore-errors (disasm-debug-detach debug)))
     (setq buffers
           (delq nil
-                (list (current-buffer)
-                      (and session (disasm-session-buffer session))
-                      (and session (disasm-session-hex-buffer session))
-                      (and session (disasm-session-sections-buffer session))
-                      (and session (disasm-session-functions-buffer session)))))
+                (append
+                 (list (current-buffer)
+                       (and session (disasm-session-buffer session))
+                       (and session (disasm-session-hex-buffer session))
+                       (and session (disasm-session-sections-buffer session))
+                       (and session (disasm-session-functions-buffer session)))
+                 (and debug (disasm-debug--quit-buffers debug)))))
     (dolist (buffer (delete-dups buffers))
       (when (buffer-live-p buffer)
         (dolist (window (get-buffer-window-list buffer nil t))
@@ -264,6 +274,14 @@ Bound to \\`q' in every `disasm' buffer."
 (define-key disasm-mode-map (kbd "q") #'disasm-quit)
 (define-key disasm-hex-mode-map (kbd "q") #'disasm-quit)
 (define-key disasm-outline-mode-map (kbd "q") #'disasm-quit)
+(define-key disasm-debug-pane-mode-map (kbd "q") #'disasm-quit)
+
+;; Execution-control keys are shared by the listing and the panes.
+(dolist (map (list disasm-mode-map disasm-debug-pane-mode-map))
+  (define-key map (kbd "<f5>") #'disasm-debug-continue)
+  (define-key map (kbd "<f10>") #'disasm-debug-nexti)
+  (define-key map (kbd "<f11>") #'disasm-debug-stepi)
+  (define-key map (kbd "<S-f11>") #'disasm-debug-finish))
 
 (provide 'disasm)
 

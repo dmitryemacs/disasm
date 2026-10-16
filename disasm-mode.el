@@ -22,6 +22,8 @@
 (require 'xref)
 (require 'subr-x)
 
+(declare-function disasm-debug--refresh-pc-overlay "disasm-debug" ())
+
 (defvar-local disasm--session nil
   "The `disasm-session' currently displayed in this buffer.")
 
@@ -364,9 +366,12 @@ Unless FORCE is non-nil, a cached result is reused when available."
                  (disasm--sync-if-available)))))))))))
 
 (defun disasm--sync-if-available ()
-  "Refresh the two-pane synchronization when `disasm-hex' is loaded."
+  "Refresh the two-pane synchronization when `disasm-hex' is loaded.
+Also re-applies the debugger's program-counter overlay, if any."
   (when (fboundp 'disasm-sync--tick)
-    (disasm-sync--tick)))
+    (disasm-sync--tick))
+  (when (fboundp 'disasm-debug--refresh-pc-overlay)
+    (disasm-debug--refresh-pc-overlay)))
 
 (defun disasm-reload (&optional force)
   "Re-run objdump for the current session and redisplay.
