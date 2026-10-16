@@ -403,7 +403,7 @@
 
 (defun disasm-test--make-bytes (len)
   "Return a unibyte string of LEN zero bytes."
-  (string-make-unibyte (make-string len 0)))
+  (encode-coding-string (make-string len 0) 'binary))
 
 (defun disasm-test--put-u16le (str off value)
   "Store VALUE at OFF in unibyte STR as a little-endian 16-bit integer."
@@ -619,6 +619,166 @@
   (should (let ((disasm-backend 'objdump)) (disasm-backend-supports-raw-p)))
   (should-not (let ((disasm-backend 'llvm-objdump))
                 (disasm-backend-supports-raw-p))))
+
+;;; M6: docked layout and sidebars
+
+(defconst disasm-test--outline-sections
+  (list (disasm-section--create :name ".text" :vma #x140001000 :size #x1000 :code-p t)
+        (disasm-section--create :name ".data" :vma #x140002000 :size #x100))
+  "Sections used by the sidebar tests.")
+
+(ert-deftest disasm-test-outline-sections ()
+  (let* ((session (disasm-session--create
+                   :file "x.exe" :bits 64
+                   :sections disasm-test--outline-sections))
+         (buffer (disasm-outline--get-buffer session 'sections)))
+    (unwind-protect
+        (with-current-buffer buffer
+          (should (eq disasm-outline-kind 'sections))
+          (should (string-match-p "\\.text" (buffer-string)))
+          (should (string-match-p "0x0000000140001000" (buffer-string)))
+          (should (string-match-p "\\.data" (buffer-string)))
+          ;; The entries are clickable and carry their address.
+          (goto-char (point-min))
+          (should (= (disasm-outline--address-at-point) #x140001000))
+          (should (eq (get-text-property (point) 'local-map)
+                      disasm-outline-entry-map))
+          (should (get-text-property (point) 'mouse-face))
+          ;; An addressless line yields nil.
+          (goto-char (point-max))
+          (should-not (disasm-outline--address-at-point)))
+      (kill-buffer buffer))))
+
+(ert-deftest disasm-test-outline-functions ()
+  (let* ((session (disasm-session--create
+                   :file "x.exe" :bits 64 :state 'ready
+                   :sections disasm-test--outline-sections
+                   :symbols '(("main" . #x140001000)
+                              (".Llocal" . #x140001005)
+                              (".text" . #x140001000)
+                              ("helper" . #x140001100))))
+         (buffer (disasm-outline--get-buffer session 'functions)))
+    (unwind-protect
+        (with-current-buffer buffer
+          (should (eq disasm-outline-kind 'functions))
+          (should (string-match-p "main" (buffer-string)))
+          (should (string-match-p "helper" (buffer-string)))
+          ;; Local labels and section-named symbols are filtered out.
+          (should-not (string-match-p "\\.Llocal" (buffer-string)))
+          (should-not (string-match-p "^\\.text" (buffer-string)))
+          (goto-char (point-min))
+          (should (= (disasm-outline--address-at-point) #x140001000))
+          (disasm-outline-next)
+          (should (= (disasm-outline--address-at-point) #x140001100)))
+      (kill-buffer buffer))))
+
+(ert-deftest disasm-test-outline-functions-loading ()
+  (let* ((session (disasm-session--create
+                   :file "x.exe" :bits 64 :state 'loading
+                   :sections disasm-test--outline-sections))
+         (buffer (disasm-outline--get-buffer session 'functions)))
+    (unwind-protect
+        (with-current-buffer buffer
+          (should (string-match-p "disassembling" (buffer-string)))
+          (should-not (disasm-outline--address-at-point)))
+      (kill-buffer buffer))))
+
+(ert-deftest disasm-test-outline-refresh ()
+  (let* ((session (disasm-session--create
+                   :file "x.exe" :bits 64 :state 'loading
+                   :sections disasm-test--outline-sections))
+         (buffer (disasm-outline--get-buffer session 'functions)))
+    (unwind-protect
+        (progn
+          (with-current-buffer buffer
+            (should (string-match-p "disassembling" (buffer-string))))
+          ;; Simulate the background disassembly completing.
+          (setf (disasm-session-state session) 'ready)
+          (setf (disasm-session-symbols session) '(("main" . #x140001000)))
+          (disasm-outline--refresh session)
+          (with-current-buffer buffer
+            (should (string-match-p "main" (buffer-string)))
+            (should-not (string-match-p "disassembling" (buffer-string)))))
+      (kill-buffer buffer))))
+
+(ert-deftest disasm-test-render-refreshes-outline ()
+  (let* ((session (disasm-session--create
+                   :file "y.exe" :bits 64 :state 'loading
+                   :sections disasm-test--outline-sections))
+         (fnbuf (disasm-outline--get-buffer session 'functions))
+         (secbuf (disasm-outline--get-buffer session 'sections))
+         (buffer (generate-new-buffer " *disasm-test*")))
+    (unwind-protect
+        (progn
+          (with-current-buffer fnbuf
+            (should (string-match-p "disassembling" (buffer-string))))
+          (setf (disasm-session-state session) 'ready)
+          (setf (disasm-session-symbols session) '(("main" . #x140001000)))
+          ;; `disasm-render' should refresh the sidebars.
+          (with-current-buffer buffer
+            (disasm-mode)
+            (setq-local disasm--session session)
+            (disasm-render))
+          (with-current-buffer fnbuf
+            (should (string-match-p "main" (buffer-string)))))
+      (kill-buffer buffer)
+      (dolist (b (list fnbuf secbuf))
+        (when (buffer-live-p b) (kill-buffer b))))))
+
+(ert-deftest disasm-test-split-fraction ()
+  (save-window-excursion
+    (let* ((window (selected-window))
+           (total (window-width window))
+           (newwin (disasm--split-fraction window 0.25 'right)))
+      (should (<= (abs (- (window-width newwin) (round (* total 0.25)))) 1)))))
+
+(ert-deftest disasm-test-docked-creates-buffers ()
+  (let* ((file (disasm-test--write-bytes (number-sequence 0 39)))
+         (session (disasm-session--create
+                   :file file :bits 64
+                   :sections (list disasm-test--code-section)))
+         (dbuf (generate-new-buffer " *disasm-list*")))
+    (unwind-protect
+        (save-window-excursion
+          (setf (disasm-session-buffer session) dbuf)
+          (disasm--open-docked session dbuf)
+          (should (buffer-live-p (disasm-session-sections-buffer session)))
+          (should (buffer-live-p (disasm-session-functions-buffer session)))
+          (should (buffer-live-p (disasm-session-hex-buffer session))))
+      (kill-buffer dbuf)
+      (delete-file file)
+      (dolist (b (list (disasm-session-sections-buffer session)
+                       (disasm-session-functions-buffer session)
+                       (disasm-session-hex-buffer session)))
+        (when (buffer-live-p b) (kill-buffer b))))))
+
+(ert-deftest disasm-test-quit-key-bindings ()
+  (should (eq (lookup-key disasm-mode-map (kbd "q")) #'disasm-quit))
+  (should (eq (lookup-key disasm-hex-mode-map (kbd "q")) #'disasm-quit))
+  (should (eq (lookup-key disasm-outline-mode-map (kbd "q")) #'disasm-quit)))
+
+(ert-deftest disasm-test-quit-kills-buffers ()
+  (let* ((file (disasm-test--write-bytes (number-sequence 0 39)))
+         (session (disasm-session--create
+                   :file file :bits 64
+                   :sections (list disasm-test--code-section)))
+         (dbuf (generate-new-buffer " *disasm-list*"))
+         (hexbuf (disasm-hex--get-buffer session)))
+    (unwind-protect
+        (progn
+          (setf (disasm-session-buffer session) dbuf)
+          (disasm-outline--get-buffer session 'sections)
+          (let ((fnbuf (disasm-outline--get-buffer session 'functions)))
+            (with-current-buffer fnbuf
+              (disasm-quit))
+            (should-not (buffer-live-p fnbuf))
+            (should-not (buffer-live-p dbuf))
+            (should-not (buffer-live-p hexbuf))))
+      (delete-file file)
+      (dolist (b (list dbuf hexbuf
+                       (disasm-session-sections-buffer session)
+                       (disasm-session-functions-buffer session)))
+        (when (buffer-live-p b) (kill-buffer b))))))
 
 (provide 'disasm-tests)
 ;;; disasm-tests.el ends here
