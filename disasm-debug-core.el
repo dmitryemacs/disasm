@@ -54,6 +54,14 @@ fills the rest."
   :type 'integer
   :group 'disasm)
 
+(defcustom disasm-threads-split 30
+  "Height of the threads pane, as a percentage.
+The threads pane is cut off the bottom of the debug column region that
+the stack pane fills, i.e. from the space below the registers and flags
+panes; the stack pane keeps the rest."
+  :type 'integer
+  :group 'disasm)
+
 (defcustom disasm-debug-memory-window #x4000
   "Number of bytes of live memory disassembled around the program counter.
 Used when the program counter lies outside the module held in a file."
@@ -75,6 +83,11 @@ Used when the program counter lies outside the module held in a file."
 (defface disasm-debug-frame-current-face
   '((t :inherit highlight :extend t))
   "Face highlighting the current (innermost) stack frame."
+  :group 'disasm)
+
+(defface disasm-debug-thread-current-face
+  '((t :inherit highlight :extend t))
+  "Face highlighting the thread the debugger currently sits in."
   :group 'disasm)
 
 (defface disasm-debug-pane-title-face
@@ -133,16 +146,23 @@ NUMBER is the debugger's identifier, ADDR the live address the breakpoint
 was inserted at and FUNC/FILE/LINE its symbolic location, when known."
   number addr enabled func file line)
 
+(cl-defstruct (disasm-debug-thread (:constructor disasm-debug-thread--create))
+  "A thread of the debugged process.
+ID is the debugger's thread identifier, STATE its execution state as
+reported by the backend and NAME/TARGET-ID its symbolic names."
+  id name target-id state)
+
 (cl-defstruct (disasm-debug-session (:constructor disasm-debug-session--create))
   "State for one live debugging session."
   backend client
   pid name exe
-  (state 'connecting) reason thread
+  (state 'connecting) reason
   pc bits arch
   registers flags frames modules entry
+  threads current-thread current-frame
   capture capture-active
   listing file delta
-  registers-buffer flags-buffer stack-buffer
+  registers-buffer flags-buffer stack-buffer threads-buffer
   hex-buffer hex-base hex-length
   live-file
   breakpoints breakpoints-buffer hit-breakpoint error)

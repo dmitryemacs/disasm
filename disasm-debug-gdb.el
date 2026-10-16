@@ -14,9 +14,9 @@
 ;; through the machine interface (see `disasm-debug-mi') and translates
 ;; its answers into the backend-neutral `disasm-debug-session' state:
 ;; registers and flags are read from `info registers' (which also decodes
-;; the flags word), the call stack from `-stack-list-frames' and the list
-;; of loaded modules together with the image path and entry point from
-;; `info files'.
+;; the flags word), the call stack from `-stack-list-frames', the threads
+;; from `-thread-info' and the list of loaded modules together with the
+;; image path and entry point from `info files'.
 
 ;;; Code:
 
@@ -124,6 +124,18 @@ Return a plist with :main (image path), :entry (integer), :bits and
         :file (disasm-mi-field frame "from")))
      stack)))
 
+(defun disasm-debug-gdb--threads-from-record (record)
+  "Extract the threads from a `-thread-info' RECORD.
+Return a list of `disasm-debug-thread'."
+  (mapcar
+   (lambda (thread)
+     (disasm-debug-thread--create
+      :id (or (disasm-mi-field thread "id") "0")
+      :name (disasm-mi-field thread "name")
+      :target-id (disasm-mi-field thread "target-id")
+      :state (or (disasm-mi-field thread "state") "unknown")))
+   (disasm-mi-field (plist-get record :data) "threads")))
+
 (defun disasm-debug-gdb--memory-from-record (record)
   "Return the bytes carried by a `-data-read-memory-bytes' RECORD, or nil."
   (when (equal (plist-get record :class) "done")
@@ -184,10 +196,16 @@ Return a plist with :main (image path), :entry (integer), :bits and
         ("stopped"
          (let* ((data (plist-get record :data))
                 (reason (disasm-mi-field data "reason"))
-                (bkptno (disasm-mi-field data "bkptno")))
+                (bkptno (disasm-mi-field data "bkptno"))
+                (thread (disasm-mi-field data "thread-id")))
            (setf (disasm-debug-session-reason session) reason)
            (setf (disasm-debug-session-hit-breakpoint session)
                  (and bkptno (string-to-number bkptno)))
+           ;; A stop puts the debugger back in the innermost frame of the
+           ;; thread that stopped.
+           (when thread
+             (setf (disasm-debug-session-current-thread session) thread))
+           (setf (disasm-debug-session-current-frame session) 0)
            (setf (disasm-debug-session-state session)
                  (if (and reason (string-prefix-p "exited" reason))
                      'exited
@@ -278,7 +296,7 @@ Call CALLBACK with the captured text and the final record."
 ;;; State refresh
 
 (defun disasm-debug-gdb-refresh (session)
-  "Query SESSION's registers, modules and stack, then refresh the UI."
+  "Query SESSION's registers, modules, stack and threads, then refresh the UI."
   (when (disasm-debug-session-client session)
     (disasm-debug-gdb--console
      session "info registers"
@@ -304,16 +322,34 @@ Call CALLBACK with the captured text and the final record."
      (disasm-debug-gdb--refresh-frames session))))
 
 (defun disasm-debug-gdb--refresh-frames (session)
-  "Read the stack of SESSION, then refresh the UI."
+  "Read the stack of SESSION, then continue refreshing."
   (disasm-mi-send
    (disasm-debug-session-client session)
    "-stack-list-frames"
    (lambda (record)
      (let ((frames (disasm-debug-gdb--frames-from-record record)))
        (setf (disasm-debug-session-frames session) frames)
-       (let ((frame (car frames)))
+       ;; The listing follows the frame the debugger sits in: the innermost
+       ;; one after a stop, or the one the user selected explicitly.
+       (let* ((level (or (disasm-debug-session-current-frame session) 0))
+              (frame (or (cl-find level frames :key #'disasm-debug-frame-level)
+                         (car frames))))
          (when frame
-           (setf (disasm-debug-session-pc session) (disasm-debug-frame-addr frame)))))
+           (setf (disasm-debug-session-pc session)
+                 (disasm-debug-frame-addr frame)))))
+     (disasm-debug-gdb--refresh-threads session))))
+
+(defun disasm-debug-gdb--refresh-threads (session)
+  "Read the threads of SESSION, then refresh the UI."
+  (disasm-mi-send
+   (disasm-debug-session-client session)
+   "-thread-info"
+   (lambda (record)
+     (setf (disasm-debug-session-threads session)
+           (disasm-debug-gdb--threads-from-record record))
+     (let ((id (disasm-mi-field (plist-get record :data) "current-thread-id")))
+       (when id
+         (setf (disasm-debug-session-current-thread session) id)))
      (disasm-debug--ui-refresh session))))
 
 ;;; Launch
@@ -427,6 +463,43 @@ Call CALLBACK with non-nil on success.  The target must be stopped."
          (message "disasm: cannot write memory at 0x%x: %s" address
                   (or (disasm-mi-field (plist-get record :data) "msg") "failed")))
        (when callback (funcall callback ok))))))
+
+;;; Threads and frames
+
+(defun disasm-debug-gdb-thread-select (session id &optional callback)
+  "Select the thread ID in SESSION's debugger and refresh its state.
+Call CALLBACK with non-nil on success.  The target must be stopped.
+Selecting a thread makes it the current one in GDB, so the subsequent
+refresh reads its registers and its innermost frame."
+  (disasm-mi-send
+   (disasm-debug-session-client session)
+   (format "-thread-select %s" id)
+   (lambda (record)
+     (if (equal (plist-get record :class) "done")
+         (progn
+           (setf (disasm-debug-session-current-thread session) id)
+           (setf (disasm-debug-session-current-frame session) 0)
+           (disasm-debug-gdb-refresh session)
+           (when callback (funcall callback t)))
+       (message "disasm: cannot select thread %s: %s" id
+                (or (disasm-mi-field (plist-get record :data) "msg") "failed"))
+       (when callback (funcall callback nil))))))
+
+(defun disasm-debug-gdb-stack-select-frame (session level &optional callback)
+  "Select the stack frame LEVEL of SESSION's debugger and refresh its state.
+Call CALLBACK with non-nil on success.  The target must be stopped."
+  (disasm-mi-send
+   (disasm-debug-session-client session)
+   (format "-stack-select-frame %d" level)
+   (lambda (record)
+     (if (equal (plist-get record :class) "done")
+         (progn
+           (setf (disasm-debug-session-current-frame session) level)
+           (disasm-debug-gdb-refresh session)
+           (when callback (funcall callback t)))
+       (message "disasm: cannot select frame %d: %s" level
+                (or (disasm-mi-field (plist-get record :data) "msg") "failed"))
+       (when callback (funcall callback nil))))))
 
 ;;; Execution control
 

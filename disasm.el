@@ -65,6 +65,7 @@
     (define-key map (kbd "R") #'disasm-debug-run)
     (define-key map (kbd "t") #'disasm-debug-toggle-breakpoint)
     (define-key map (kbd "B") #'disasm-debug-breakpoints)
+    (define-key map (kbd "T") #'disasm-debug-threads)
     (define-key map (kbd "X") #'disasm-debug-clear-breakpoints)
     (define-key map (kbd "g") #'disasm-debug-goto)
     (define-key map (kbd "f") #'disasm-debug-follow)

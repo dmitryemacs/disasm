@@ -10,11 +10,13 @@
 
 ;;; Commentary:
 
-;; The right-hand column of the debug layout: three read-only panes that
-;; show the CPU registers, the flags and the call stack of the debugged
-;; process.  They all share `disasm-debug-pane-mode' and differ in the
-;; buffer-local value of `disasm-debug-pane-kind'.  Lines that stand for an
-;; address are clickable and jump the listing to that address.
+;; The right-hand column of the debug layout: four read-only panes that
+;; show the CPU registers, the flags, the threads and the call stack of
+;; the debugged process.  They all share `disasm-debug-pane-mode' and
+;; differ in the buffer-local value of `disasm-debug-pane-kind'.  Lines
+;; that stand for an address jump the listing to that address; a thread
+;; line switches the debugger to that thread and a frame line selects
+;; that frame, which also moves the listing there.
 
 ;;; Code:
 
@@ -25,9 +27,11 @@
 
 (declare-function disasm-debug--goto-address "disasm-debug" (session addr))
 (declare-function disasm-debug-delete-breakpoint "disasm-debug" (session breakpoint))
+(declare-function disasm-debug-select-frame "disasm-debug" (session level))
+(declare-function disasm-debug-select-thread "disasm-debug" (session id))
 
 (defvar-local disasm-debug-pane-kind 'registers
-  "Which pane this buffer shows: `registers', `flags' or `stack'.")
+  "Which pane this buffer shows: `registers', `flags', `threads' or `stack'.")
 
 (defvar-local disasm-debug-pane-session nil
   "The `disasm-debug-session' displayed in this pane.")
@@ -84,6 +88,7 @@
     (pcase kind
       ('registers (setf (disasm-debug-session-registers-buffer session) buffer))
       ('flags (setf (disasm-debug-session-flags-buffer session) buffer))
+      ('threads (setf (disasm-debug-session-threads-buffer session) buffer))
       ('stack (setf (disasm-debug-session-stack-buffer session) buffer))
       ('breakpoints (setf (disasm-debug-session-breakpoints-buffer session) buffer)))
     buffer))
@@ -93,6 +98,7 @@
   (when session
     (dolist (buffer (list (disasm-debug-session-registers-buffer session)
                           (disasm-debug-session-flags-buffer session)
+                          (disasm-debug-session-threads-buffer session)
                           (disasm-debug-session-stack-buffer session)
                           (disasm-debug-session-breakpoints-buffer session)))
       (when (buffer-live-p buffer)
@@ -115,6 +121,7 @@
     (pcase disasm-debug-pane-kind
       ('registers (disasm-debug-pane--render-registers session))
       ('flags (disasm-debug-pane--render-flags session))
+      ('threads (disasm-debug-pane--render-threads session))
       ('stack (disasm-debug-pane--render-stack session))
       ('breakpoints (disasm-debug-pane--render-breakpoints session)))
     (goto-char (point-min))))
@@ -190,7 +197,9 @@
         (let* ((level (disasm-debug-frame-level frame))
                (addr (disasm-debug-frame-addr frame))
                (start (point))
-               (current (zerop level)))
+               (current (= level (or (disasm-debug-session-current-frame
+                                      session)
+                                     0))))
           (insert (propertize (format "%s#%-2d " (if current ">" " ") level)
                               'face (if current
                                         'disasm-debug-frame-current-face
@@ -206,13 +215,51 @@
           (when (and addr current)
             (add-text-properties start (line-end-position)
                                  '(face disasm-debug-frame-current-face)))
-          (when addr
-            (add-text-properties
-             start (line-end-position)
-             (list 'disasm-debug-addr addr
-                   'mouse-face 'highlight
-                   'local-map disasm-debug-pane-entry-map
-                   'help-echo "mouse-1: show this frame in the listing")))
+          (add-text-properties
+           start (line-end-position)
+           (list 'disasm-debug-frame level
+                 'disasm-debug-addr addr
+                 'mouse-face 'highlight
+                 'local-map disasm-debug-pane-entry-map
+                 'help-echo "mouse-1: select this frame"))
+          (insert "\n"))))))
+
+(defun disasm-debug-pane--render-threads (session)
+  "Render SESSION's threads into the current buffer."
+  (disasm-debug-pane--insert-title "threads")
+  (let ((threads (disasm-debug-session-threads session))
+        (current (disasm-debug-session-current-thread session)))
+    (if (null threads)
+        (insert (propertize (format "%s\n" (disasm-debug-pane--empty-text session))
+                            'face 'disasm-comment-face))
+      (dolist (thread threads)
+        (let* ((id (disasm-debug-thread-id thread))
+               (state (disasm-debug-thread-state thread))
+               (active (and current (equal id current)))
+               (start (point)))
+          (insert (propertize (format "%s %-4s " (if active ">" " ") id)
+                              'face (if active
+                                        'disasm-debug-thread-current-face
+                                      'disasm-comment-face)))
+          (insert (propertize (format "%-8s" state)
+                              'face (if (equal state "stopped")
+                                        'disasm-debug-register-name-face
+                                      'disasm-comment-face)))
+          (insert " ")
+          (insert (propertize (or (disasm-debug-thread-name thread)
+                                  (disasm-debug-thread-target-id thread)
+                                  "??")
+                              'face 'disasm-symbol-face))
+          (let ((target (disasm-debug-thread-target-id thread)))
+            (when (and target (disasm-debug-thread-name thread))
+              (insert (propertize (format "  (%s)" target)
+                                  'face 'disasm-comment-face))))
+          (add-text-properties
+           start (line-end-position)
+           (list 'disasm-debug-thread id
+                 'mouse-face 'highlight
+                 'local-map disasm-debug-pane-entry-map
+                 'help-echo "mouse-1: switch to this thread"))
           (insert "\n"))))))
 
 (defun disasm-debug-pane--render-breakpoints (session)
@@ -294,12 +341,40 @@
   "Return the register name on the current pane line, or nil."
   (get-text-property (line-beginning-position) 'disasm-debug-register))
 
+(defun disasm-debug-pane--frame-at-point ()
+  "Return the stack frame level on the current pane line, or nil."
+  (get-text-property (line-beginning-position) 'disasm-debug-frame))
+
+(defun disasm-debug-pane--thread-at-point ()
+  "Return the thread id on the current pane line, or nil."
+  (get-text-property (line-beginning-position) 'disasm-debug-thread))
+
+(defun disasm-debug-pane--entry-at-point ()
+  "Return non-nil when the current pane line stands for a selectable entry:
+an address, a stack frame or a thread."
+  (or (disasm-debug-pane--address-at-point)
+      (disasm-debug-pane--frame-at-point)
+      (disasm-debug-pane--thread-at-point)))
+
 (defun disasm-debug-pane-goto ()
-  "Show the address on the current pane line in the listing."
+  "Act on the entry shown on the current pane line.
+An address is shown in the listing; a stack frame is selected, which
+makes the registers describe it and moves the listing to its address; a
+thread becomes the current one, which does the same for its innermost
+frame."
   (interactive)
-  (let ((addr (disasm-debug-pane--address-at-point)))
-    (unless addr (user-error "No address on this line"))
-    (disasm-debug--goto-address disasm-debug-pane-session addr)))
+  (let ((session disasm-debug-pane-session))
+    (cond
+     ((disasm-debug-pane--thread-at-point)
+      (disasm-debug-select-thread
+       session (disasm-debug-pane--thread-at-point)))
+     ((disasm-debug-pane--frame-at-point)
+      (disasm-debug-select-frame
+       session (disasm-debug-pane--frame-at-point)))
+     (t
+      (let ((addr (disasm-debug-pane--address-at-point)))
+        (unless addr (user-error "No address on this line"))
+        (disasm-debug--goto-address session addr))))))
 
 (defun disasm-debug-pane-mouse-goto (event)
   "Show the entry clicked with EVENT in the listing."
@@ -308,25 +383,25 @@
   (disasm-debug-pane-goto))
 
 (defun disasm-debug-pane-next ()
-  "Move to the next clickable pane entry."
+  "Move to the next selectable pane entry."
   (interactive)
   (let ((start (point))
         (found nil))
     (forward-line 1)
     (while (and (not found) (not (eobp)))
-      (if (disasm-debug-pane--address-at-point)
+      (if (disasm-debug-pane--entry-at-point)
           (setq found t)
         (forward-line 1)))
     (unless found (goto-char start))))
 
 (defun disasm-debug-pane-prev ()
-  "Move to the previous clickable pane entry."
+  "Move to the previous selectable pane entry."
   (interactive)
   (let ((start (point))
         (found nil))
     (forward-line -1)
     (while (and (not found) (not (bobp)))
-      (if (disasm-debug-pane--address-at-point)
+      (if (disasm-debug-pane--entry-at-point)
           (setq found t)
         (forward-line -1)))
     (unless found (goto-char start))))
@@ -352,7 +427,7 @@
 
 ;;;###autoload
 (define-derived-mode disasm-debug-pane-mode special-mode "Disasm-Debug"
-  "Major mode for the `disasm' registers, flags and stack panes.
+  "Major mode for the `disasm' registers, flags, threads and stack panes.
 
 \\{disasm-debug-pane-mode-map}"
   (setq-local truncate-lines t)

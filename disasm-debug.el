@@ -12,21 +12,24 @@
 
 ;; The user interface of the `disasm' debugger: attaching to a running
 ;; process, the x64dbg-like debug layout and the glue that keeps the
-;; listing, the hex pane and the registers/flags/stack panes in step with
-;; the debugged process.  The backend-neutral session state comes from
-;; `disasm-debug-core'; the actual debugger is driven through
+;; listing, the hex pane and the registers/flags/threads/stack panes in
+;; step with the debugged process.  The backend-neutral session state
+;; comes from `disasm-debug-core'; the actual debugger is driven through
 ;; `disasm-debug-gdb'.
 ;;
 ;;   M-x disasm-attach    attach to a running process (C-c d a)
 ;;   M-x disasm-debug-run run a program under the debugger (C-c d R)
+;;   M-x disasm-debug-threads show the threads (C-c d T)
 ;;
-;; Once attached the right-hand column shows the registers, the flags and
-;; the call stack; the listing follows the program counter and the
-;; instruction at the PC is highlighted.  Execution can be controlled
-;; (continue/step/next/finish/interrupt), breakpoints toggled on the
-;; listing and, with \\[disasm-debug-edit], the register or memory under
-;; point can be overwritten (`C-c d w' writes memory at any address and
-;; `C-c d E' sets any register).
+;; Once attached the right-hand column shows the registers, the flags,
+;; the threads and the call stack; the listing follows the program
+;; counter and the instruction at the PC is highlighted.  Execution can
+;; be controlled (continue/step/next/finish/interrupt), breakpoints
+;; toggled on the listing and, with \\[disasm-debug-edit], the register or
+;; memory under point can be overwritten (`C-c d w' writes memory at any
+;; address and `C-c d E' sets any register).  In the stack pane RET
+;; selects the frame under point, in the threads pane it selects the
+;; thread, and in both cases the registers and the listing follow.
 
 ;;; Code:
 
@@ -210,6 +213,16 @@ nil when the disassembly fails."
   "Re-read SESSION's state from the debugger and refresh the UI."
   (pcase (disasm-debug-session-backend session)
     ('gdb-mi (disasm-debug-gdb-refresh session))))
+
+(defun disasm-debug--select-thread (session id)
+  "Ask SESSION's backend to select the thread ID and refresh its state."
+  (pcase (disasm-debug-session-backend session)
+    ('gdb-mi (disasm-debug-gdb-thread-select session id))))
+
+(defun disasm-debug--select-frame (session level)
+  "Ask SESSION's backend to select the stack frame LEVEL and refresh its state."
+  (pcase (disasm-debug-session-backend session)
+    ('gdb-mi (disasm-debug-gdb-stack-select-frame session level))))
 
 (defun disasm-debug--register-at-point ()
   "Return the register name at point, or nil."
@@ -407,6 +420,7 @@ Also refreshes the live hex pane, which follows the listing."
     (unless (buffer-local-value 'disasm-debug--laid-out listing)
       (let ((registers (disasm-debug-pane--get-buffer session 'registers))
             (flags (disasm-debug-pane--get-buffer session 'flags))
+            (threads (disasm-debug-pane--get-buffer session 'threads))
             (stack (disasm-debug-pane--get-buffer session 'stack))
             (hexbuf (disasm-debug--live-hex-buffer session)))
         (pop-to-buffer listing)
@@ -421,10 +435,16 @@ Also refreshes the live hex pane, which follows the listing."
                                                  'above))
                  (flagwin (disasm--split-fraction right
                                                   (/ disasm-flags-split 100.0)
-                                                  'above)))
+                                                  'above))
+                 ;; The threads pane is cut off the bottom of the space
+                 ;; the stack pane fills; the stack pane keeps the rest.
+                 (threadwin (disasm--split-fraction right
+                                                    (/ disasm-threads-split 100.0)
+                                                    'below)))
             (set-window-buffer regwin registers)
             (set-window-buffer flagwin flags)
             (set-window-buffer right stack)
+            (set-window-buffer threadwin threads)
             ;; Left column: the live hex pane below the listing.
             (let ((hexwin (disasm--split-fraction win
                                                   (/ disasm-hex-height 100.0)
@@ -780,6 +800,31 @@ address on the current line."
          (buffer (disasm-debug-pane--get-buffer session 'breakpoints)))
     (pop-to-buffer buffer)))
 
+(defun disasm-debug-threads ()
+  "Show the threads of the current session (C-c d T).
+The threads pane is part of the debug layout already; this command brings
+it back when its window has been closed."
+  (interactive)
+  (let* ((session (disasm-debug--current-session))
+         (buffer (disasm-debug-pane--get-buffer session 'threads)))
+    (pop-to-buffer buffer)))
+
+(defun disasm-debug-select-thread (session id)
+  "Make the thread ID the current one in SESSION.
+The registers, the stack and the listing then describe that thread: the
+listing moves to its innermost frame."
+  (unless (eq (disasm-debug-session-state session) 'stopped)
+    (user-error "The target must be stopped to change threads"))
+  (disasm-debug--select-thread session id))
+
+(defun disasm-debug-select-frame (session level)
+  "Select the stack frame LEVEL of SESSION.
+The registers then describe that frame and the listing moves to its
+address."
+  (unless (eq (disasm-debug-session-state session) 'stopped)
+    (user-error "The target must be stopped to change frames"))
+  (disasm-debug--select-frame session level))
+
 ;;; Editing commands
 
 (defun disasm-debug-edit-register ()
@@ -980,6 +1025,7 @@ this falls back to `forward-char'."
   (delq nil (list (disasm-debug-session-listing session)
                   (disasm-debug-session-registers-buffer session)
                   (disasm-debug-session-flags-buffer session)
+                  (disasm-debug-session-threads-buffer session)
                   (disasm-debug-session-stack-buffer session)
                   (disasm-debug-session-breakpoints-buffer session)
                   (disasm-debug-session-hex-buffer session))))
