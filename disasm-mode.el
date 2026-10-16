@@ -27,6 +27,10 @@
 (defvar-local disasm--session nil
   "The `disasm-session' currently displayed in this buffer.")
 
+(defvar-local disasm--live-label nil
+  "When non-nil, a label marking the listing as live memory.
+Used by the debugger for regions without a file on disk.")
+
 (defvar disasm-target-map
   (let ((map (make-sparse-keymap)))
     (define-key map [mouse-1] #'disasm-mouse-follow)
@@ -419,7 +423,9 @@ Unless FORCE is non-nil, a cached result is reused when available."
              (sec (and insn (disasm-insn-section insn))))
         (concat
          " "
-         (propertize (file-name-nondirectory (disasm-session-file session)) 'face 'bold)
+         (if disasm--live-label
+             (propertize disasm--live-label 'face 'disasm-debug-live-face)
+           (propertize (file-name-nondirectory (disasm-session-file session)) 'face 'bold))
          (format "  %s / %s  "
                  (or (disasm-session-format session) "?")
                  (or (disasm-session-arch session) "?"))

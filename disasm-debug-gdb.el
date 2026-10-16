@@ -122,6 +122,17 @@ Return a plist with :main (image path), :entry (integer), :bits and
         :file (disasm-mi-field frame "from")))
      stack)))
 
+(defun disasm-debug-gdb--memory-from-record (record)
+  "Return the bytes carried by a `-data-read-memory-bytes' RECORD, or nil."
+  (when (equal (plist-get record :class) "done")
+    (let ((memory (disasm-mi-field (plist-get record :data) "memory")))
+      (when memory
+        (apply #'concat
+               (mapcar (lambda (chunk)
+                         (disasm--hex-string-to-unibyte
+                          (or (disasm-mi-field chunk "contents") "")))
+                       memory))))))
+
 ;;; Records
 
 (defun disasm-debug-gdb--on-record (session record _token)
@@ -287,6 +298,19 @@ Call CALLBACK with the captured text and the final record."
 (defun disasm-debug-gdb-interrupt (session)
   "Interrupt SESSION's target."
   (disasm-debug-gdb--send session "-exec-interrupt"))
+
+;;; Live memory
+
+(defun disasm-debug-gdb-read-memory (session address length)
+  "Read LENGTH bytes of SESSION's target memory at live ADDRESS.
+Return a unibyte string, or nil when the memory cannot be read.  The
+target must be stopped, otherwise the request is not answered."
+  (when (and (> length 0)
+             (disasm-debug-session-client session))
+    (disasm-debug-gdb--memory-from-record
+     (disasm-mi-request
+      (disasm-debug-session-client session)
+      (format "-data-read-memory-bytes 0x%x %d" address length)))))
 
 (provide 'disasm-debug-gdb)
 ;;; disasm-debug-gdb.el ends here

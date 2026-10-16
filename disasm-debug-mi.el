@@ -280,6 +280,25 @@ Return the numeric token used to frame COMMAND."
   "Send COMMAND to CLIENT and ignore the result."
   (disasm-mi-send client command #'ignore))
 
+(defun disasm-mi-request (client command &optional timeout)
+  "Send COMMAND to CLIENT and wait for its result record.
+Return the result record, or nil when the wait TIMEOUT (seconds,
+default 10) elapses or the debugger dies.  This is only safe while
+the target is stopped, since commands sent to a running GDB/MI
+process may never be answered."
+  (let ((record nil)
+        (done nil))
+    (disasm-mi-send client command (lambda (result)
+                                     (setq record result)
+                                     (setq done t)))
+    (let ((deadline (+ (float-time) (or timeout 10)))
+          (process (disasm-mi-client-process client)))
+      (while (and (not done)
+                  (< (float-time) deadline)
+                  (process-live-p process))
+        (accept-process-output process 0.02)))
+    record))
+
 (defun disasm-mi-exec (client command callback)
   "Run the CLI COMMAND inside CLIENT and pass its output to CALLBACK."
   (disasm-mi-send

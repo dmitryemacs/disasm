@@ -60,6 +60,11 @@ Used when the program counter lies outside the module held in a file."
   :type 'integer
   :group 'disasm)
 
+(defcustom disasm-debug-hex-window #x1000
+  "Number of bytes of live memory shown in the hex pane while debugging."
+  :type 'integer
+  :group 'disasm)
+
 ;;; Faces
 
 (defface disasm-debug-pc-face
@@ -97,6 +102,11 @@ Used when the program counter lies outside the module held in a file."
   "Face marking a register whose value changed at the last stop."
   :group 'disasm)
 
+(defface disasm-debug-live-face
+  '((t :inherit font-lock-string-face :weight bold))
+  "Face marking a listing or pane as live memory rather than a file."
+  :group 'disasm)
+
 ;;; Data structures
 
 (cl-defstruct (disasm-debug-module (:constructor disasm-debug-module--create))
@@ -117,6 +127,8 @@ Used when the program counter lies outside the module held in a file."
   capture capture-active
   listing file delta
   registers-buffer flags-buffer stack-buffer
+  hex-buffer hex-base hex-length
+  live-file
   breakpoints error)
 
 ;;; Helpers

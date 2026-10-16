@@ -28,6 +28,14 @@
   "Number of characters before the bytes column (offset + vaddr + padding).")
 (defvar-local disasm--hex-buffer nil
   "In a `disasm-mode' buffer, the associated hex pane buffer.")
+(defvar-local disasm-hex--live nil
+  "Non-nil when this pane shows live target memory rather than a file.")
+(defvar-local disasm-hex--base 0
+  "Live address of the first byte rendered by a live hex pane.")
+(defvar-local disasm-hex--bits 64
+  "Address width in bits of a live hex pane.")
+(defvar-local disasm-hex--goto-live nil
+  "Function called by `disasm-hex-goto' in a live pane to show an address.")
 (defvar disasm--sync-inhibit nil
   "When non-nil, the sync hook does nothing (prevents feedback loops).")
 (defvar disasm-sync-mode)
@@ -103,6 +111,7 @@
 
 (defun disasm-hex--render (session)
   "Render the hex dump of SESSION's file into the current buffer."
+  (setq-local disasm-hex--live nil)
   (let* ((file (disasm-session-file session))
          (bits (or (disasm-session-bits session) 64))
          (data (with-temp-buffer
@@ -173,6 +182,46 @@
                  'face 'disasm-section-face)))
       (goto-char (point-min)))))
 
+(defun disasm-hex--render-live (base bytes bits)
+  "Render BYTES, a unibyte string of live memory, starting at address BASE.
+BITS selects the width of the address column.  Unlike the file view
+there is no separate file-offset column: the single leading column is
+the live address itself."
+  (let* ((vw (if (> (or bits 64) 32) 16 8))
+         (prefix (+ vw 2))
+         (len (length bytes))
+         (addr-format (concat "%0" (number-to-string vw) "x")))
+    (setq-local disasm--hex-prefix prefix)
+    (setq-local disasm-hex--live t)
+    (setq-local disasm-hex--base base)
+    (setq-local disasm-hex--bits (or bits 64))
+    (let ((inhibit-read-only t)
+          (off 0))
+      (erase-buffer)
+      (while (< off len)
+        (let ((end (min len (+ off 16)))
+              (i 0)
+              (hexstr "")
+              (asciistr ""))
+          (while (< (+ off i) end)
+            (let ((b (aref bytes (+ off i))))
+              (setq hexstr (concat hexstr (aref disasm-hex--byte-hex b)))
+              (setq asciistr (concat asciistr (aref disasm-hex--byte-ascii b))))
+            (setq i (1+ i)))
+          (while (< i 16)
+            (setq hexstr (concat hexstr "   "))
+            (setq i (1+ i)))
+          (insert (concat
+                   (propertize (format addr-format (+ base off))
+                               'face 'disasm-hex-vaddr-face)
+                   "  "
+                   (propertize hexstr 'face 'disasm-hex-bytes-face)
+                   "  "
+                   (propertize asciistr 'face 'disasm-hex-ascii-face)
+                   "\n")))
+        (setq off (+ off 16)))
+      (goto-char (point-min)))))
+
 ;;; Buffer lifecycle
 
 (defun disasm-hex--buffer-name (file)
@@ -239,29 +288,42 @@
 (defun disasm-hex--header-line ()
   "Return the header line for the hex pane."
   (condition-case nil
-      (let* ((session disasm--session)
-             (offset (disasm-hex--current-offset))
-             (vaddr (and session (disasm--offset-to-vaddr session offset))))
-        (concat
-         " hex "
-         (propertize (file-name-nondirectory (disasm-session-file session)) 'face 'bold)
-         (format "  off 0x%x" offset)
-         (if vaddr
-             (format "  vaddr %s"
-                     (disasm--format-address vaddr (or (disasm-session-bits session) 64)))
-           "")))
+      (if disasm-hex--live
+          (let* ((bits (or disasm-hex--bits 64))
+                 (index (* 16 (1- (line-number-at-pos))))
+                 (addr (+ (or disasm-hex--base 0) index)))
+            (concat
+             " hex "
+             (propertize "live memory" 'face 'disasm-debug-live-face)
+             (format "  base %s" (disasm--format-address (or disasm-hex--base 0) bits))
+             (format "  addr %s" (disasm--format-address addr bits))))
+        (let* ((session disasm--session)
+               (offset (disasm-hex--current-offset))
+               (vaddr (and session (disasm--offset-to-vaddr session offset))))
+          (concat
+           " hex "
+           (propertize (file-name-nondirectory (disasm-session-file session)) 'face 'bold)
+           (format "  off 0x%x" offset)
+           (if vaddr
+               (format "  vaddr %s"
+                       (disasm--format-address vaddr (or (disasm-session-bits session) 64)))
+             ""))))
     (error "")))
 
 (defun disasm-hex-goto (address)
   "Go to hexadecimal ADDRESS (a virtual address or a file offset)."
   (interactive (list (read-string "Address/offset (hex): ")))
-  (unless disasm--session
-    (user-error "No disasm session in this buffer"))
-  (let* ((value (disasm--hex-to-int address))
-         (offset (or (disasm--vaddr-to-offset disasm--session value) value))
-         (line (1+ (/ offset 16))))
-    (goto-char (point-min))
-    (forward-line (1- line))))
+  (if disasm-hex--live
+      (if disasm-hex--goto-live
+          (funcall disasm-hex--goto-live (disasm--hex-to-int address))
+        (user-error "No debugger attached to this live hex pane"))
+    (unless disasm--session
+      (user-error "No disasm session in this buffer"))
+    (let* ((value (disasm--hex-to-int address))
+           (offset (or (disasm--vaddr-to-offset disasm--session value) value))
+           (line (1+ (/ offset 16))))
+      (goto-char (point-min))
+      (forward-line (1- line)))))
 
 ;;; Two-pane synchronization
 
@@ -334,13 +396,16 @@
     (condition-case nil
         (let* ((window (selected-window))
                (buffer (window-buffer window))
+               (driver (buffer-local-value 'disasm--sync-driver buffer))
                (session (buffer-local-value 'disasm--session buffer)))
-          (when session
+          (cond
+           (driver (funcall driver window))
+           (session
             (cond
              ((eq buffer (disasm-session-buffer session))
               (disasm-sync--disasm-drives session window))
              ((eq buffer (disasm-session-hex-buffer session))
-              (disasm-sync--hex-drives session window)))))
+              (disasm-sync--hex-drives session window))))))
       (error nil))))
 
 ;;;###autoload

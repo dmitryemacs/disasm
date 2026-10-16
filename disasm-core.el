@@ -257,6 +257,43 @@ The value is passed to objdump as `--adjust-vma'."
   "Format integer ADDR as a hexadecimal address of BITS width."
   (format (if (> bits 32) "0x%016x" "0x%08x") addr))
 
+(defun disasm--hex-string-to-unibyte (hex)
+  "Decode the hexadecimal string HEX into a unibyte string.
+HEX is a run of an even number of hexadecimal digits, as returned by
+GDB/MI when reading target memory.  An odd trailing digit is dropped."
+  (let ((n (/ (length hex) 2))
+        (bytes nil))
+    (dotimes (i n)
+      (push (string-to-number (substring hex (* i 2) (+ (* i 2) 2)) 16)
+            bytes))
+    (apply #'unibyte-string (nreverse bytes))))
+
+(defun disasm--unibyte-to-int (bytes &optional start count)
+  "Read COUNT little-endian bytes of BYTES starting at START as an integer.
+COUNT defaults to the length of BYTES minus START."
+  (let* ((start (or start 0))
+         (count (or count (- (length bytes) start)))
+         (value 0))
+    (dotimes (i count)
+      (setq value (+ value (ash (aref bytes (+ start i)) (* 8 i)))))
+    value))
+
+(defun disasm--align-down (value align)
+  "Return VALUE rounded down to a multiple of ALIGN."
+  (if (and (integerp align) (> align 0))
+      (- value (% value align))
+    value))
+
+;;; Synchronization hooks
+
+(defvar-local disasm--sync-driver nil
+  "Buffer-local function driving two-pane synchronization.
+When non-nil it is called with the selected window by
+`disasm-sync--tick' instead of the default file-based behaviour.
+The debugger installs such a driver to keep a live hex pane in step
+with the listing.")
+(put 'disasm--sync-driver 'permanent-local t)
+
 (defun disasm--plain-address (addr bits)
   "Format integer ADDR like objdump does, without the 0x prefix."
   (format (if (> bits 32) "%016x" "%08x") addr))
