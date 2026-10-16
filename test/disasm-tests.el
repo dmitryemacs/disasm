@@ -911,6 +911,152 @@
     (should (equal (disasm-debug-frame-func (nth 0 frames)) "main"))
     (should (= (disasm-debug-frame-level (nth 1 frames)) 1))))
 
+;;; GDB breakpoints and launch
+
+(ert-deftest disasm-test-gdb-breakpoint-from-insert ()
+  (let* ((record (disasm-mi--parse-record
+                  ?^ (concat "done,bkpt={number=\"2\",type=\"breakpoint\","
+                             "disp=\"keep\",enabled=\"y\","
+                             "addr=\"0x000000014000145a\",func=\"add\","
+                             "line=\"3\",times=\"0\"}")))
+         (bp (disasm-debug-gdb--breakpoint-from-record record)))
+    (should (= (disasm-debug-breakpoint-number bp) 2))
+    (should (= (disasm-debug-breakpoint-addr bp) #x14000145a))
+    (should (disasm-debug-breakpoint-enabled bp))
+    (should (equal (disasm-debug-breakpoint-func bp) "add"))
+    (should (= (disasm-debug-breakpoint-line bp) 3))))
+
+(ert-deftest disasm-test-gdb-breakpoint-disabled ()
+  (let* ((record (disasm-mi--parse-record
+                  ?^ "done,bkpt={number=\"1\",enabled=\"n\",addr=\"0x401000\"}"))
+         (bp (disasm-debug-gdb--breakpoint-from-record record)))
+    (should-not (disasm-debug-breakpoint-enabled bp))
+    (should (= (disasm-debug-breakpoint-addr bp) #x401000))))
+
+(ert-deftest disasm-test-gdb-breakpoint-from-record-error ()
+  (let ((record (disasm-mi--parse-record ?^ "error,msg=\"No symbol\"")))
+    (should (null (disasm-debug-gdb--breakpoint-from-record record)))))
+
+(ert-deftest disasm-test-gdb-breakpoints-from-list ()
+  (let* ((record (disasm-mi--parse-record
+                  ?^ (concat "done,BreakpointTable={nr_rows=\"2\","
+                             "body=[bkpt={number=\"1\",addr=\"0x401000\",func=\"main\"},"
+                             "bkpt={number=\"2\",addr=\"0x401100\",func=\"add\"}]}")))
+         (breakpoints (disasm-debug-gdb--breakpoints-from-record record)))
+    (should (= (length breakpoints) 2))
+    (should (= (disasm-debug-breakpoint-number (nth 0 breakpoints)) 1))
+    (should (= (disasm-debug-breakpoint-addr (nth 1 breakpoints)) #x401100))
+    (should (equal (disasm-debug-breakpoint-func (nth 0 breakpoints)) "main"))))
+
+(ert-deftest disasm-test-gdb-breakpoints-from-empty-list ()
+  (let* ((record (disasm-mi--parse-record
+                  ?^ "done,BreakpointTable={nr_rows=\"0\",body=[]}"))
+         (breakpoints (disasm-debug-gdb--breakpoints-from-record record)))
+    (should (null breakpoints))))
+
+(ert-deftest disasm-test-gdb-quote ()
+  (should (equal (disasm-debug-gdb--quote "one two") "\"one two\""))
+  (should (equal (disasm-debug-gdb--quote "") "\"\""))
+  (should (equal (disasm-debug-gdb--quote nil) "\"\""))
+  (should (equal (disasm-debug-gdb--quote "a\"b") "\"a\\\"b\""))
+  (should (equal (disasm-debug-gdb--quote "C:\\x") "\"C:\\\\x\"")))
+
+;;; Breakpoint bookkeeping
+
+(ert-deftest disasm-test-debug-breakpoint-at ()
+  (let ((session (disasm-debug-session--create
+                  :breakpoints (list (disasm-debug-breakpoint--create
+                                      :number 1 :addr #x401000)
+                                     (disasm-debug-breakpoint--create
+                                      :number 2 :addr #x402000)))))
+    (should (= (disasm-debug-breakpoint-number
+                (disasm-debug--breakpoint-at session #x402000))
+               2))
+    (should (null (disasm-debug--breakpoint-at session #x403000)))))
+
+(ert-deftest disasm-test-debug-toggle-breakpoint-requires-stopped ()
+  (let ((session (disasm-debug-session--create :state 'running)))
+    (should-error (disasm-debug-toggle-breakpoint-at session #x401000)
+                  :type 'user-error)))
+
+(ert-deftest disasm-test-debug-toggle-breakpoint-clears-existing ()
+  (let ((session (disasm-debug-session--create
+                  :state 'stopped
+                  :breakpoints (list (disasm-debug-breakpoint--create
+                                      :number 7 :addr #x401000))))
+        (deleted nil))
+    (cl-letf (((symbol-function 'disasm-debug--break-delete)
+               (lambda (_session number &optional callback)
+                 (setq deleted number)
+                 (when callback (funcall callback t)))))
+      (disasm-debug-toggle-breakpoint-at session #x401000)
+      (should (eql deleted 7))
+      (should (null (disasm-debug-session-breakpoints session))))))
+
+(ert-deftest disasm-test-debug-toggle-breakpoint-inserts ()
+  (let ((session (disasm-debug-session--create :state 'stopped)))
+    (cl-letf (((symbol-function 'disasm-debug--break-insert)
+               (lambda (_session address callback)
+                 (funcall callback (disasm-debug-breakpoint--create
+                                    :number 1 :addr address :enabled t))))
+              ((symbol-function 'disasm-debug--after-breakpoint-change)
+               #'ignore))
+      (disasm-debug-toggle-breakpoint-at session #x401000)
+      (should (= (length (disasm-debug-session-breakpoints session)) 1))
+      (should (= (disasm-debug-breakpoint-addr
+                  (car (disasm-debug-session-breakpoints session)))
+                 #x401000)))))
+
+;;; Breakpoint pane
+
+(ert-deftest disasm-test-debug-pane-render-breakpoints ()
+  (let ((session (disasm-debug-session--create
+                  :state 'stopped :bits 64 :hit-breakpoint 2
+                  :breakpoints (list (disasm-debug-breakpoint--create
+                                      :number 1 :addr #x401000
+                                      :enabled t :func "main")
+                                     (disasm-debug-breakpoint--create
+                                      :number 2 :addr #x401100
+                                      :enabled t :func "add")))))
+    (with-temp-buffer
+      (setq-local disasm-debug-pane-kind 'breakpoints)
+      (disasm-debug-pane--render-breakpoints session)
+      (let ((text (buffer-string)))
+        (should (string-match-p "breakpoints" text))
+        (should (string-match-p "main" text))
+        (should (string-match-p "add" text))
+        (should (string-match-p "401000" text))))))
+
+(ert-deftest disasm-test-debug-pane-render-breakpoints-empty ()
+  (let ((session (disasm-debug-session--create
+                  :state 'stopped :bits 64 :breakpoints nil)))
+    (with-temp-buffer
+      (setq-local disasm-debug-pane-kind 'breakpoints)
+      (disasm-debug-pane--render-breakpoints session)
+      (should (string-match-p "breakpoints" (buffer-string))))))
+
+;;; Windows break helper
+
+(ert-deftest disasm-test-win-helper-script ()
+  (should (string-match-p "DebugBreakProcess" disasm-debug-win--script))
+  (should (string-match-p "OpenProcess" disasm-debug-win--script))
+  (should (string-match-p "ready" disasm-debug-win--script)))
+
+;;; New key bindings
+
+(ert-deftest disasm-test-debug-breakpoint-bindings ()
+  (should (eq (lookup-key disasm-prefix-map (kbd "R")) #'disasm-debug-run))
+  (should (eq (lookup-key disasm-prefix-map (kbd "t"))
+              #'disasm-debug-toggle-breakpoint))
+  (should (eq (lookup-key disasm-prefix-map (kbd "B"))
+              #'disasm-debug-breakpoints))
+  (should (eq (lookup-key disasm-prefix-map (kbd "X"))
+              #'disasm-debug-clear-breakpoints))
+  (should (eq (lookup-key disasm-mode-map (kbd "<f2>"))
+              #'disasm-debug-toggle-breakpoint))
+  (should (eq (lookup-key disasm-debug-pane-mode-map (kbd "<f2>"))
+              #'disasm-debug-toggle-breakpoint)))
+
 ;;; Address mapping and helpers
 
 (ert-deftest disasm-test-debug-first-vma ()
