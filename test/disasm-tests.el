@@ -51,6 +51,44 @@
    "   14000101d:\t66 66 2e 0f 1f 84 00 \tdata16 cs nop WORD PTR [rax+rax*1+0x0]\n"
    "   140001024:\t00 00 00 00 \n"))
 
+(defconst disasm-test--llvm-sections-output
+  (concat
+   "hello.exe:\tfile format coff-x86-64\n"
+   "\n"
+   "Sections:\n"
+   "Idx Name            Size     VMA              Type\n"
+   "  0                 00000000 0000000000000000 \n"
+   "  1 .text           00006c28 0000000140001000 TEXT, DATA\n"
+   "  2 .data           000000d0 0000000140008000 DATA\n"
+   "  3 .bss            00000000 000000014000c000 BSS\n")
+  "Captured `llvm-objdump -h' output (64-bit PE, variable width columns).")
+
+(defconst disasm-test--llvm-sections32-output
+  (concat
+   "hello-elf32.o:\tfile format elf32-i386\n"
+   "\n"
+   "Sections:\n"
+   "Idx Name            Size     VMA      Type\n"
+   "  0                 00000000 00000000 \n"
+   "  2 .text           00000097 00000000 TEXT\n"
+   "  6 .eh_frame       00000078 00000000 DATA\n")
+  "Captured `llvm-objdump -h' output (32-bit ELF object, narrow columns).")
+
+(defconst disasm-test--llvm-disasm-output
+  (concat
+   "hello.exe:\tfile format coff-x86-64\n"
+   "\n"
+   "Disassembly of section .text:\n"
+   "\n"
+   "0000000140001000 <main>:\n"
+   "140001000: c3                          \tret\n"
+   "140001001: e8 fa ff ff ff              \tcall\t0x140001000 <main>\n"
+   "140001006: 0f 84 34 00 00 00           \tje\t0x140001040 <other>\n"
+   "14000100c: ff 25 12 34 00 00           \tjmp\tqword ptr [rip + 0x3412]\n"
+   "140001012: 48 b8 88 77 66 55 44 33 22 11 \tmovabs\trax, 0x1122334455667788\n"
+   "14000101c: 90                          \tnop\n")
+  "Captured `llvm-objdump -d --x86-asm-syntax=intel' output.")
+
 (defun disasm-test--parsed ()
   "Return the parsed GNU objdump disassembly fixture."
   (disasm-parse-disassembly
@@ -360,6 +398,227 @@
             ;; addresses and mnemonics are still highlighted
             (should (disasm-test--face-present-p 'disasm-mnemonic-face))))
       (kill-buffer buffer))))
+
+;;; M5: llvm-objdump backend and PE/ELF file-offset recovery
+
+(defun disasm-test--make-bytes (len)
+  "Return a unibyte string of LEN zero bytes."
+  (string-make-unibyte (make-string len 0)))
+
+(defun disasm-test--put-u16le (str off value)
+  "Store VALUE at OFF in unibyte STR as a little-endian 16-bit integer."
+  (aset str off (logand value #xff))
+  (aset str (+ off 1) (logand (ash value -8) #xff)))
+
+(defun disasm-test--put-u32le (str off value)
+  "Store VALUE at OFF in unibyte STR as a little-endian 32-bit integer."
+  (dotimes (i 4)
+    (aset str (+ off i) (logand (ash value (* -8 i)) #xff))))
+
+(defun disasm-test--put-u64le (str off value)
+  "Store VALUE at OFF in unibyte STR as a little-endian 64-bit integer."
+  (dotimes (i 8)
+    (aset str (+ off i) (logand (ash value (* -8 i)) #xff))))
+
+(defun disasm-test--write-binary (str)
+  "Write unibyte STR to a temporary file and return its name."
+  (let ((file (make-temp-file "disasm-bin-" nil ".bin"))
+        (coding-system-for-write 'no-conversion))
+    (write-region str nil file nil 'silent)
+    file))
+
+(defun disasm-test--make-pe ()
+  "Build a minimal 64-bit PE image with a single `.text' section."
+  (let* ((lfanew #x80)
+         (opt-size #xF0)
+         (file (disasm-test--make-bytes (+ #x188 40))))
+    (aset file 0 ?M)
+    (aset file 1 ?Z)
+    (disasm-test--put-u32le file #x3C lfanew)          ; e_lfanew
+    (aset file lfanew ?P)
+    (aset file (1+ lfanew) ?E)
+    (disasm-test--put-u16le file (+ lfanew 4) #x8664)  ; machine
+    (disasm-test--put-u16le file (+ lfanew 6) 1)       ; number of sections
+    (disasm-test--put-u16le file (+ lfanew 20) opt-size)
+    (let ((opt (+ lfanew 24)))
+      (disasm-test--put-u16le file opt #x20b)          ; PE32+ magic
+      (disasm-test--put-u32le file (+ opt 16) #x1000)  ; address of entry point
+      (disasm-test--put-u64le file (+ opt 24) #x140000000)) ; image base
+    (let ((sec (+ lfanew 24 opt-size)))                ; section table
+      (dotimes (i 5) (aset file (+ sec i) (aref ".text" i)))
+      (disasm-test--put-u32le file (+ sec 8) #x2000)   ; virtual size
+      (disasm-test--put-u32le file (+ sec 12) #x1000)  ; virtual address
+      (disasm-test--put-u32le file (+ sec 16) #x2000)  ; size of raw data
+      (disasm-test--put-u32le file (+ sec 20) #x400))  ; pointer to raw data
+    file))
+
+(defun disasm-test--make-elf64 ()
+  "Build a minimal 64-bit little-endian ELF with a `.text' section."
+  (let* ((shoff #x100)
+         (shentsize 64)
+         (strtab-off #x200)
+         (file (disasm-test--make-bytes #x330)))
+    (aset file 0 #x7f) (aset file 1 ?E) (aset file 2 ?L) (aset file 3 ?F)
+    (aset file 4 2)                                     ; ELFCLASS64
+    (aset file 5 1)                                     ; ELFDATA2LSB
+    (aset file 6 1)                                     ; EV_CURRENT
+    (disasm-test--put-u16le file #x10 2)                ; ET_EXEC
+    (disasm-test--put-u16le file #x12 #x3e)             ; EM_X86_64
+    (disasm-test--put-u32le file #x14 1)                ; e_version
+    (disasm-test--put-u64le file #x18 #x401000)         ; e_entry
+    (disasm-test--put-u64le file #x28 shoff)            ; e_shoff
+    (disasm-test--put-u16le file #x34 64)               ; e_ehsize
+    (disasm-test--put-u16le file #x3A shentsize)        ; e_shentsize
+    (disasm-test--put-u16le file #x3C 3)                ; e_shnum
+    (disasm-test--put-u16le file #x3E 2)                ; e_shstrndx
+    (let ((s "\0.text\0.shstrtab\0") (i 0))
+      (while (< i (length s))
+        (aset file (+ strtab-off i) (aref s i))
+        (setq i (1+ i))))
+    (let ((b (+ shoff shentsize)))                      ; .text
+      (disasm-test--put-u32le file b 1)                 ; sh_name
+      (disasm-test--put-u32le file (+ b 4) 1)           ; SHT_PROGBITS
+      (disasm-test--put-u64le file (+ b #x10) #x401000); sh_addr
+      (disasm-test--put-u64le file (+ b #x18) #x300)    ; sh_offset
+      (disasm-test--put-u64le file (+ b #x20) #x20))    ; sh_size
+    (let ((b (+ shoff (* 2 shentsize))))                ; .shstrtab
+      (disasm-test--put-u32le file b 7)                 ; sh_name
+      (disasm-test--put-u32le file (+ b 4) 3)           ; SHT_STRTAB
+      (disasm-test--put-u64le file (+ b #x18) strtab-off)
+      (disasm-test--put-u64le file (+ b #x20) 17))
+    file))
+
+(ert-deftest disasm-test-llvm-sections-64 ()
+  (let* ((secs (disasm-llvm--parse-sections disasm-test--llvm-sections-output))
+         (text (car secs))
+         (data (cadr secs))
+         (bss (caddr secs)))
+    (should (= (length secs) 3))
+    (should (equal (disasm-section-name text) ".text"))
+    (should (= (disasm-section-vma text) #x140001000))
+    (should (= (disasm-section-size text) #x6c28))
+    (should (disasm-section-code-p text))
+    (should-not (disasm-section-fileoff text))
+    (should (equal (disasm-section-name data) ".data"))
+    (should-not (disasm-section-code-p data))
+    (should (equal (disasm-section-name bss) ".bss"))
+    (should (equal (disasm-section-flags bss) "BSS"))))
+
+(ert-deftest disasm-test-llvm-sections-32 ()
+  (let* ((secs (disasm-llvm--parse-sections disasm-test--llvm-sections32-output))
+         (text (car secs)))
+    (should (= (length secs) 2))
+    (should (equal (disasm-section-name text) ".text"))
+    (should (= (disasm-section-size text) #x97))
+    (should (= (disasm-section-vma text) 0))
+    (should (disasm-section-code-p text))))
+
+(ert-deftest disasm-test-llvm-disassembly ()
+  (let* ((sections (disasm-llvm--parse-sections disasm-test--llvm-sections-output))
+         (parsed (disasm-parse-disassembly disasm-test--llvm-disasm-output sections))
+         (insns (plist-get parsed :insns))
+         (labels (plist-get parsed :labels)))
+    (should (= (length insns) 6))
+    (should (equal labels '(("main" . #x140001000))))
+    (let ((ret (aref insns 0)))
+      (should (equal (disasm-insn-mnemonic ret) "ret"))
+      (should (equal (disasm-insn-operands ret) ""))
+      (should (= (disasm-insn-size ret) 1))
+      (should (equal (disasm-insn-bytes ret) "c3")))
+    (let ((call (aref insns 1)))
+      (should (eq (disasm-insn-kind call) 'call))
+      (should (equal (disasm-insn-mnemonic call) "call"))
+      (should (equal (disasm-insn-operands call) "0x140001000 <main>"))
+      (should (= (disasm-insn-target call) #x140001000)))
+    (let ((je (aref insns 2)))
+      (should (eq (disasm-insn-kind je) 'jmp))
+      (should (= (disasm-insn-target je) #x140001040)))
+    (let ((jmp (aref insns 3)))
+      (should (eq (disasm-insn-kind jmp) 'jmp))
+      (should-not (disasm-insn-target jmp)))
+    (let ((movabs (aref insns 4)))
+      (should (equal (disasm-insn-mnemonic movabs) "movabs"))
+      (should (= (disasm-insn-size movabs) 10)))))
+
+(ert-deftest disasm-test-llvm-raw-unsupported ()
+  (should-error (disasm-llvm--disasm-args "x" nil '(:arch "i386:x86-64")))
+  (should-error (disasm-llvm-header "x" '(:arch "i386"))))
+
+(ert-deftest disasm-test-llvm-args ()
+  (let ((disasm-syntax 'intel) (disasm-demangle t) (disasm-llvm-objdump-extra-args nil))
+    (should (equal (disasm-llvm--disasm-args "f.exe" nil nil)
+                   '("-d" "--x86-asm-syntax=intel" "-C" "f.exe"))))
+  (let ((disasm-syntax 'att) (disasm-demangle nil) (disasm-llvm-objdump-extra-args '("--no-show-raw-insn")))
+    (should (equal (disasm-llvm--disasm-args "f.exe" t nil)
+                   '("-D" "--no-show-raw-insn" "f.exe")))))
+
+(ert-deftest disasm-test-image-pe ()
+  (let* ((file (disasm-test--write-binary (disasm-test--make-pe)))
+         (info (disasm-image-info file)))
+    (unwind-protect
+        (progn
+          (should (eq (plist-get info :kind) 'pe))
+          (should (= (plist-get info :bits) 64))
+          (should (= (plist-get info :entry) #x140001000))
+          (let* ((secs (plist-get info :sections))
+                 (text (car secs)))
+            (should (= (length secs) 1))
+            (should (equal (disasm-section-name text) ".text"))
+            (should (= (disasm-section-vma text) #x140001000))
+            (should (= (disasm-section-size text) #x2000))
+            (should (= (disasm-section-fileoff text) #x400))))
+      (delete-file file))))
+
+(ert-deftest disasm-test-image-elf64 ()
+  (let* ((file (disasm-test--write-binary (disasm-test--make-elf64)))
+         (info (disasm-image-info file)))
+    (unwind-protect
+        (progn
+          (should (eq (plist-get info :kind) 'elf))
+          (should (= (plist-get info :bits) 64))
+          (should (= (plist-get info :entry) #x401000))
+          (let* ((secs (plist-get info :sections))
+                 (text (car secs)))
+            ;; Section 0 (null) has no content and is skipped; `.text' and
+            ;; `.shstrtab' both carry bytes on disk.
+            (should (= (length secs) 2))
+            (should (equal (disasm-section-name text) ".text"))
+            (should (= (disasm-section-vma text) #x401000))
+            (should (= (disasm-section-size text) #x20))
+            (should (= (disasm-section-fileoff text) #x300))))
+      (delete-file file))))
+
+(ert-deftest disasm-test-image-none-for-raw ()
+  (let ((file (disasm-test--write-bytes (number-sequence 0 63))))
+    (unwind-protect
+        (should-not (disasm-image-info file))
+      (delete-file file))))
+
+(ert-deftest disasm-test-image-fill-offsets ()
+  (let* ((file (disasm-test--write-binary (disasm-test--make-pe)))
+         (info (disasm-image-info file))
+         (sections (list (disasm-section--create :name ".text" :vma #x140001000
+                                                 :size #x6c28 :fileoff nil
+                                                 :flags "TEXT, DATA" :code-p t)
+                         (disasm-section--create :name ".bss" :vma #x140000000
+                                                 :size 0 :fileoff nil
+                                                 :flags "BSS"))))
+    (unwind-protect
+        (progn
+          (disasm-image-fill-offsets info sections)
+          (should (= (disasm-section-fileoff (car sections)) #x400))
+          (should (string-match-p "CONTENTS"
+                                  (disasm-section-flags (car sections))))
+          (should-not (disasm-section-fileoff (cadr sections))))
+      (delete-file file))))
+
+(ert-deftest disasm-test-backend-names ()
+  (should (equal (let ((disasm-backend 'objdump)) (disasm-backend-name)) "objdump"))
+  (should (equal (let ((disasm-backend 'llvm-objdump)) (disasm-backend-name))
+                 "llvm-objdump"))
+  (should (let ((disasm-backend 'objdump)) (disasm-backend-supports-raw-p)))
+  (should-not (let ((disasm-backend 'llvm-objdump))
+                (disasm-backend-supports-raw-p))))
 
 (provide 'disasm-tests)
 ;;; disasm-tests.el ends here
