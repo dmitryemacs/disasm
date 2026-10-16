@@ -957,5 +957,134 @@
   (should (equal (disasm-proc--split-csv-line "\"he said \"\"hi\"\"\",\"1\"")
                  '("he said \"hi\"" "1"))))
 
+;;; M9: live memory and arbitrary-address disassembly
+
+(ert-deftest disasm-test-hex-string-to-unibyte ()
+  (should (equal (disasm--hex-string-to-unibyte "48656c6c6f") "Hello"))
+  (should (equal (disasm--hex-string-to-unibyte "") ""))
+  ;; odd trailing digit is dropped
+  (should (equal (length (disasm--hex-string-to-unibyte "486")) 1)))
+
+(ert-deftest disasm-test-unibyte-to-int ()
+  (should (= (disasm--unibyte-to-int (unibyte-string 1 0 0 0 0 0 0 0)) 1))
+  (should (= (disasm--unibyte-to-int (unibyte-string #xff #xff)) #xffff))
+  (should (= (disasm--unibyte-to-int (unibyte-string 0 1 0 0) 1 2) 1)))
+
+(ert-deftest disasm-test-align-down ()
+  (should (= (disasm--align-down #x1234 16) #x1230))
+  (should (= (disasm--align-down #x1230 16) #x1230))
+  (should (= (disasm--align-down #x10 0) #x10)))
+
+(ert-deftest disasm-test-gdb-memory-from-record ()
+  (let ((record
+         (list :type ?^ :class "done"
+               :data (list (cons "memory"
+                                 (list (list (cons "begin" "0x1000")
+                                             (cons "offset" "0x0")
+                                             (cons "end" "0x1004")
+                                             (cons "contents" "01020304"))))))))
+    (should (equal (disasm-debug-gdb--memory-from-record record)
+                   (unibyte-string 1 2 3 4))))
+  ;; chunks are concatenated in order
+  (let ((record
+         (list :type ?^ :class "done"
+               :data (list (cons "memory"
+                                 (list (list (cons "contents" "0102"))
+                                       (list (cons "contents" "0304"))))))))
+    (should (equal (disasm-debug-gdb--memory-from-record record)
+                   (unibyte-string 1 2 3 4))))
+  ;; an error record yields nil
+  (should-not (disasm-debug-gdb--memory-from-record
+               (list :type ?^ :class "error"
+                     :data (list (cons "msg" "Unable to read memory."))))))
+
+(ert-deftest disasm-test-hex-render-live ()
+  (with-temp-buffer
+    (disasm-hex-mode)
+    (disasm-hex--render-live #x400000 (unibyte-string 72 101 108 108 111) 64)
+    (should disasm-hex--live)
+    (should (= disasm-hex--base #x400000))
+    (should (= disasm-hex--bits 64))
+    (should (= disasm--hex-prefix 18))
+    (let ((line (buffer-substring-no-properties (point-min) (line-end-position))))
+      (should (equal (substring line 0 16) "0000000000400000"))
+      (should (string-match-p "48 65 6c 6c 6f" line))
+      (should (string-match-p "Hello$" line)))
+    ;; highlight by byte index inside the window
+    (setq-local disasm--hex-overlays nil)
+    (disasm--hex-highlight-bytes (current-buffer) 1 2)
+    (should (= (length disasm--hex-overlays) 1))
+    (let ((ov (car disasm--hex-overlays)))
+      (should (= (overlay-start ov) (+ (point-min) disasm--hex-prefix 3)))
+      (should (= (overlay-end ov) (+ (point-min) disasm--hex-prefix 8))))))
+
+(ert-deftest disasm-test-hex-live-header-line ()
+  (with-temp-buffer
+    (disasm-hex-mode)
+    (disasm-hex--render-live #x400000 (unibyte-string 1 2 3 4) 64)
+    (let ((header (disasm-hex--header-line)))
+      (should (string-match-p "live memory" header))
+      (should (string-match-p "0000000000400000" header)))))
+
+(ert-deftest disasm-test-debug-operand-address ()
+  (should (= (disasm-debug--operand-address
+              "QWORD PTR [rip+0x3412]        # 140001040 <other>")
+             #x140001040))
+  (should (= (disasm-debug--operand-address "0x2dc5(%rip)  # 0x140004000")
+             #x140004000))
+  (should-not (disasm-debug--operand-address "0x1"))
+  (should-not (disasm-debug--operand-address nil)))
+
+(ert-deftest disasm-test-debug-follow-target ()
+  (let* ((direct (disasm-insn--create :addr #x140001001 :mnemonic "call"
+                                      :operands "140001040 <other>"
+                                      :kind 'call :target #x140001040
+                                      :size 5 :line 1))
+         (indirect (disasm-insn--create
+                    :addr #x14000100c :mnemonic "jmp"
+                    :operands "QWORD PTR [rip+0x3412]        # 140001040 <other>"
+                    :kind 'jmp :size 6 :line 1))
+         (session (disasm-session--create :file "x" :bits 64
+                                          :insns (vector direct) :state 'ready))
+         (dsession (disasm-debug-session--create :delta #x100)))
+    (with-temp-buffer
+      (setq-local disasm--session session)
+      (insert "x")
+      (goto-char (point-min))
+      (should (= (disasm-debug--follow-target dsession) (+ #x140001040 #x100))))
+    (setf (disasm-session-insns session) (vector indirect))
+    (with-temp-buffer
+      (setq-local disasm--session session)
+      (insert "x")
+      (goto-char (point-min))
+      (should (= (disasm-debug--follow-target dsession) (+ #x140001040 #x100))))
+    ;; nothing to follow
+    (setf (disasm-session-insns session)
+          (vector (disasm-insn--create :addr #x140001000 :mnemonic "nop"
+                                       :size 1 :line 1)))
+    (with-temp-buffer
+      (setq-local disasm--session session)
+      (insert "x")
+      (goto-char (point-min))
+      (should-not (disasm-debug--follow-target dsession)))))
+
+(ert-deftest disasm-test-debug-live-session ()
+  "Live disassembly of bytes read from memory (requires objdump)."
+  (skip-unless (ignore-errors (and (disasm-backend-program) t)))
+  ;; mov eax, 1 ; ret
+  (let* ((bytes (unibyte-string #xb8 1 0 0 0 #xc3))
+         (session (disasm-debug-session--create :bits 64 :state 'stopped))
+         (dsession (disasm-debug--live-session session bytes "i386:x86-64" #x1000)))
+    (should dsession)
+    (should (eq (disasm-session-state dsession) 'ready))
+    (let ((insns (disasm-session-insns dsession)))
+      (should (= (length insns) 2))
+      (should (= (disasm-insn-addr (aref insns 0)) #x1000))
+      (should (equal (disasm-insn-mnemonic (aref insns 0)) "mov"))
+      (should (= (disasm-insn-addr (aref insns 1)) #x1005))
+      (should (equal (disasm-insn-mnemonic (aref insns 1)) "ret")))
+    (when (disasm-debug-session-live-file session)
+      (delete-file (disasm-debug-session-live-file session)))))
+
 (provide 'disasm-tests)
 ;;; disasm-tests.el ends here
