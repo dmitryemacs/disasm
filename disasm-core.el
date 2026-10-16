@@ -29,13 +29,20 @@
 (defcustom disasm-backend 'objdump
   "Disassembly backend to use."
   :type '(choice (const :tag "GNU objdump" objdump)
-                 (const :tag "LLVM objdump (not implemented yet)" llvm-objdump))
+                 (const :tag "LLVM objdump" llvm-objdump))
   :group 'disasm)
 
 (defcustom disasm-objdump-program nil
-  "Absolute path to the objdump executable.
+  "Absolute path to the GNU objdump executable.
 When nil, `disasm' auto-detects a suitable binary (Cygwin, MinGW or
 whatever is found on `exec-path')."
+  :type '(choice (const :tag "Auto-detect" nil) file)
+  :group 'disasm)
+
+(defcustom disasm-llvm-objdump-program nil
+  "Absolute path to the llvm-objdump executable.
+When nil, `disasm' auto-detects a suitable binary (common Qt/LLVM
+installations or whatever is found on `exec-path')."
   :type '(choice (const :tag "Auto-detect" nil) file)
   :group 'disasm)
 
@@ -70,6 +77,11 @@ always highlight operands."
 
 (defcustom disasm-objdump-extra-args nil
   "Extra command line arguments passed to objdump."
+  :type '(repeat string)
+  :group 'disasm)
+
+(defcustom disasm-llvm-objdump-extra-args nil
+  "Extra command line arguments passed to llvm-objdump."
   :type '(repeat string)
   :group 'disasm)
 
