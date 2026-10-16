@@ -52,13 +52,13 @@
    "   140001024:\t00 00 00 00 \n"))
 
 (defun disasm-test--parsed ()
-  "Return the parsed disassembly fixture."
-  (disasm-objdump--parse-disassembly
+  "Return the parsed GNU objdump disassembly fixture."
+  (disasm-parse-disassembly
    disasm-test--disasm-output
    (disasm-objdump--parse-sections disasm-test--sections-output)))
 
 (ert-deftest disasm-test-header ()
-  (let ((h (disasm-objdump--parse-header disasm-test--header-output)))
+  (let ((h (disasm-parse-header disasm-test--header-output)))
     (should (equal (plist-get h :format) "pei-x86-64"))
     (should (equal (plist-get h :arch) "i386:x86-64"))
     (should (= (plist-get h :entry) #x140001000))))
@@ -264,7 +264,7 @@
                  '("-b" "binary" "-m" "arm"))))
 
 (ert-deftest disasm-test-header-llvm-style ()
-  (let ((h (disasm-objdump--parse-header
+  (let ((h (disasm-parse-header
             (concat "x: file format coff-x86-64\n"
                     "architecture: x86_64\n"
                     "start address: 0x0000000140001000\n"))))
