@@ -1232,5 +1232,196 @@
     (when (disasm-debug-session-live-file session)
       (delete-file (disasm-debug-session-live-file session)))))
 
+;;; M11: register and memory editing
+
+(ert-deftest disasm-test-unibyte-to-hex ()
+  (should (equal (disasm--unibyte-to-hex (unibyte-string 0 #x10 #xff)) "0010ff"))
+  (should (equal (disasm--unibyte-to-hex "") "")))
+
+(ert-deftest disasm-test-debug-parse-value ()
+  (should (= (disasm-debug--parse-value "0x10") 16))
+  (should (= (disasm-debug--parse-value "0XFF") 255))
+  (should (= (disasm-debug--parse-value "10") 16))
+  (should (= (disasm-debug--parse-value "0d16") 16))
+  (should (= (disasm-debug--parse-value " 0d16 ") 16))
+  (should-error (disasm-debug--parse-value "") :type 'user-error)
+  (should-error (disasm-debug--parse-value "0xZZ") :type 'user-error)
+  (should-error (disasm-debug--parse-value "hello") :type 'user-error))
+
+(ert-deftest disasm-test-debug-parse-bytes ()
+  (should (equal (disasm-debug--parse-bytes "DE AD BE EF")
+                 (unibyte-string #xde #xad #xbe #xef)))
+  (should (equal (disasm-debug--parse-bytes "deadbeef")
+                 (unibyte-string #xde #xad #xbe #xef)))
+  (should (equal (disasm-debug--parse-bytes "0xDE 0xAD")
+                 (unibyte-string #xde #xad)))
+  (should (equal (disasm-debug--parse-bytes "\\xDE\\xAD")
+                 (unibyte-string #xde #xad)))
+  (should (equal (disasm-debug--parse-bytes "de:ad,be-ef")
+                 (unibyte-string #xde #xad #xbe #xef)))
+  (should-error (disasm-debug--parse-bytes "") :type 'user-error)
+  (should-error (disasm-debug--parse-bytes "abc") :type 'user-error)
+  (should-error (disasm-debug--parse-bytes "zz") :type 'user-error))
+
+(ert-deftest disasm-test-gdb-write-register ()
+  (let ((session (disasm-debug-session--create :state 'stopped))
+        (command nil)
+        (result nil))
+    (cl-letf (((symbol-function 'disasm-mi-send)
+               (lambda (_client cmd callback)
+                 (setq command cmd)
+                 (funcall callback (list :type ?^ :class "done")))))
+      (disasm-debug-gdb-write-register session "rax" #x10
+                                       (lambda (ok) (setq result ok))))
+    (should (equal command "-gdb-set $rax = 0x10"))
+    (should result)))
+
+(ert-deftest disasm-test-gdb-write-register-failure ()
+  (let ((session (disasm-debug-session--create :state 'stopped))
+        (result t))
+    (cl-letf (((symbol-function 'disasm-mi-send)
+               (lambda (_client _cmd callback)
+                 (funcall callback (list :type ?^ :class "error"
+                                         :data (list (cons "msg" "bad")))))))
+      (disasm-debug-gdb-write-register session "rax" 1
+                                       (lambda (ok) (setq result ok))))
+    (should-not result)))
+
+(ert-deftest disasm-test-gdb-write-memory ()
+  (let ((session (disasm-debug-session--create :state 'stopped))
+        (command nil)
+        (result nil))
+    (cl-letf (((symbol-function 'disasm-mi-send)
+               (lambda (_client cmd callback)
+                 (setq command cmd)
+                 (funcall callback (list :type ?^ :class "done")))))
+      (disasm-debug-gdb-write-memory session #x401000
+                                     (unibyte-string #xde #xad #xbe #xef)
+                                     (lambda (ok) (setq result ok))))
+    (should (equal command "-data-write-memory-bytes 0x401000 deadbeef"))
+    (should result)))
+
+(ert-deftest disasm-test-hex-byte-index-at-point ()
+  (with-temp-buffer
+    (disasm-hex-mode)
+    (disasm-hex--render-live #x400000 (unibyte-string 1 2 3 4 5 6) 64)
+    (should (= disasm--hex-prefix 18))
+    (move-to-column 18)
+    (should (= (disasm-hex--byte-index-at-point) 0))
+    (move-to-column 33)
+    (should (= (disasm-hex--byte-index-at-point) 5))
+    ;; the printable-ASCII column maps to the same bytes
+    (move-to-column 68)
+    (should (= (disasm-hex--byte-index-at-point) 0))
+    (move-to-column 70)
+    (should (= (disasm-hex--byte-index-at-point) 2))
+    ;; before the bytes there is no byte
+    (move-to-column 5)
+    (should-not (disasm-hex--byte-index-at-point))))
+
+(ert-deftest disasm-test-hex-live-address-at-point ()
+  (with-temp-buffer
+    (disasm-hex-mode)
+    (disasm-hex--render-live #x400000 (unibyte-string 1 2 3 4 5 6) 64)
+    (move-to-column 18)
+    (should (= (disasm-hex--live-address-at-point) #x400000))
+    (move-to-column 33)
+    (should (= (disasm-hex--live-address-at-point) #x400005))
+    ;; a non-live pane has no live address
+    (setq-local disasm-hex--live nil)
+    (should-not (disasm-hex--live-address-at-point))))
+
+(ert-deftest disasm-test-debug-pane-register-at-point ()
+  (let ((session (disasm-debug-session--create
+                  :state 'stopped :bits 64
+                  :registers '(("rax" . "0x10") ("rip" . "0x1000")))))
+    (with-temp-buffer
+      (setq-local disasm-debug-pane-kind 'registers)
+      (disasm-debug-pane--render-registers session)
+      (goto-char (point-min))
+      (forward-line 1)                  ; the "rax" line
+      (should (equal (disasm-debug-pane--register-at-point) "rax"))
+      (should (= (disasm-debug-pane--address-at-point) #x10))
+      (forward-line 1)                  ; the "rip" line
+      (should (equal (disasm-debug-pane--register-at-point) "rip")))))
+
+(ert-deftest disasm-test-debug-edit-register-requires-stopped ()
+  (let ((session (disasm-debug-session--create
+                  :backend 'gdb-mi :state 'running :bits 64
+                  :registers '(("rax" . "0x10")))))
+    (with-temp-buffer
+      (disasm-debug-pane-mode)
+      (setq-local buffer-read-only nil)
+      (setq-local disasm-debug-pane-kind 'registers)
+      (setq-local disasm-debug-pane-session session)
+      (disasm-debug-pane--render-registers session)
+      (goto-char (point-min))
+      (forward-line 1)
+      (should-error (disasm-debug-edit-register) :type 'user-error))))
+
+(ert-deftest disasm-test-debug-edit-register ()
+  (let ((session (disasm-debug-session--create
+                  :backend 'gdb-mi :state 'stopped :bits 64
+                  :registers '(("rax" . "0x10"))))
+        (command nil)
+        (refreshed nil))
+    (cl-letf (((symbol-function 'disasm-mi-send)
+               (lambda (_client cmd callback)
+                 (setq command cmd)
+                 (funcall callback (list :type ?^ :class "done"))))
+              ((symbol-function 'disasm-debug--refresh-state)
+               (lambda (_session) (setq refreshed t))))
+      (with-temp-buffer
+        (disasm-debug-pane-mode)
+        (setq-local buffer-read-only nil)
+        (setq-local disasm-debug-pane-kind 'registers)
+        (setq-local disasm-debug-pane-session session)
+        (disasm-debug-pane--render-registers session)
+        (goto-char (point-min))
+        (forward-line 1)
+        (cl-letf (((symbol-function 'read-string) (lambda (&rest _) "0x42")))
+          (disasm-debug-edit-register))))
+    (should (equal command "-gdb-set $rax = 0x42"))
+    (should refreshed)))
+
+(ert-deftest disasm-test-debug-edit-memory ()
+  (let ((session (disasm-debug-session--create
+                  :backend 'gdb-mi :state 'stopped :bits 64))
+        (command nil))
+    (cl-letf (((symbol-function 'disasm-mi-send)
+               (lambda (_client cmd callback)
+                 (setq command cmd)
+                 (funcall callback (list :type ?^ :class "done"))))
+              ((symbol-function 'disasm-debug--after-memory-write) #'ignore))
+      (with-temp-buffer
+        (disasm-hex-mode)
+        (setq-local disasm-debug--session session)
+        (disasm-hex--render-live #x400000 (unibyte-string 0 0 0 0) 64)
+        (move-to-column 18)
+        (cl-letf (((symbol-function 'read-string) (lambda (&rest _) "aa bb")))
+          (disasm-debug-edit-memory))))
+    (should (equal command "-data-write-memory-bytes 0x400000 aabb"))))
+
+(ert-deftest disasm-test-debug-write-memory-requires-stopped ()
+  (let ((session (disasm-debug-session--create :state 'running :bits 64)))
+    (should-error (disasm-debug-edit-memory-at session #x400000)
+                  :type 'user-error)))
+
+(ert-deftest disasm-test-debug-edit-dispatch ()
+  ;; in neither a pane nor a hex pane there is nothing to edit
+  (with-temp-buffer
+    (should-error (disasm-debug-edit) :type 'user-error)))
+
+(ert-deftest disasm-test-debug-edit-bindings ()
+  (should (eq (lookup-key disasm-prefix-map (kbd "e")) #'disasm-debug-edit))
+  (should (eq (lookup-key disasm-prefix-map (kbd "w"))
+              #'disasm-debug-write-memory))
+  (should (eq (lookup-key disasm-prefix-map (kbd "E"))
+              #'disasm-debug-set-register))
+  (should (eq (lookup-key disasm-debug-pane-mode-map (kbd "e"))
+              #'disasm-debug-edit))
+  (should (eq (lookup-key disasm-hex-mode-map (kbd "e"))
+              #'disasm-debug-edit)))
+
 (provide 'disasm-tests)
 ;;; disasm-tests.el ends here
