@@ -238,6 +238,33 @@ assumed to live at."
         (disasm-file tmp)))
      (t (user-error "No file to disassemble")))))
 
+;;; Quitting
+
+(defun disasm-quit ()
+  "Close the current session's listing, hex and sidebar buffers.
+Bound to \\`q' in every `disasm' buffer."
+  (interactive)
+  (let ((session disasm--session)
+        (buffers nil))
+    (setq buffers
+          (delq nil
+                (list (current-buffer)
+                      (and session (disasm-session-buffer session))
+                      (and session (disasm-session-hex-buffer session))
+                      (and session (disasm-session-sections-buffer session))
+                      (and session (disasm-session-functions-buffer session)))))
+    (dolist (buffer (delete-dups buffers))
+      (when (buffer-live-p buffer)
+        (dolist (window (get-buffer-window-list buffer nil t))
+          (with-selected-window window
+            (ignore-errors (delete-window))))
+        (when (buffer-live-p buffer)
+          (ignore-errors (kill-buffer buffer)))))))
+
+(define-key disasm-mode-map (kbd "q") #'disasm-quit)
+(define-key disasm-hex-mode-map (kbd "q") #'disasm-quit)
+(define-key disasm-outline-mode-map (kbd "q") #'disasm-quit)
+
 (provide 'disasm)
 
 (when disasm-bind-prefix
