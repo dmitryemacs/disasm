@@ -780,5 +780,182 @@
                        (disasm-session-functions-buffer session)))
         (when (buffer-live-p b) (kill-buffer b))))))
 
+;;; GDB/MI parser
+
+(ert-deftest disasm-test-mi-parse-done-value ()
+  (let ((record (disasm-mi--parse-record ?^ "done,value=\"0x1234\"")))
+    (should (eq (plist-get record :type) ?^))
+    (should (equal (plist-get record :class) "done"))
+    (should (equal (disasm-mi-field (plist-get record :data) "value") "0x1234"))))
+
+(ert-deftest disasm-test-mi-parse-bare-class ()
+  (let ((record (disasm-mi--parse-record ?* "stopped")))
+    (should (eq (plist-get record :type) ?*))
+    (should (equal (plist-get record :class) "stopped"))
+    (should (null (plist-get record :data)))))
+
+(ert-deftest disasm-test-mi-parse-nested-tuple ()
+  (let* ((record (disasm-mi--parse-record
+                  ?^ "done,frame={addr=\"0x401000\",func=\"main\",args=[]}"))
+         (frame (disasm-mi-field (plist-get record :data) "frame")))
+    (should (equal (disasm-mi-field frame "addr") "0x401000"))
+    (should (equal (disasm-mi-field frame "func") "main"))
+    (should (equal (disasm-mi-field frame "args") nil))))
+
+(ert-deftest disasm-test-mi-parse-list-of-values ()
+  (let* ((record (disasm-mi--parse-record ?^ "done,register-names=[\"rax\",\"rbx\"]"))
+         (names (disasm-mi-field (plist-get record :data) "register-names")))
+    (should (equal names '("rax" "rbx")))))
+
+(ert-deftest disasm-test-mi-parse-list-of-results ()
+  (let* ((record (disasm-mi--parse-record
+                  ?^ "done,body=[bkpt={number=\"1\"},bkpt={number=\"2\"}]"))
+         (body (disasm-mi-field (plist-get record :data) "body")))
+    (should (= (length body) 2))
+    (should (equal (disasm-mi-field (cdr (nth 0 body)) "number") "1"))
+    (should (equal (disasm-mi-field (cdr (nth 1 body)) "number") "2"))))
+
+(ert-deftest disasm-test-mi-parse-stream ()
+  (let ((record (disasm-mi--parse-record ?~ "\"hello\\n\"")))
+    (should (eq (plist-get record :type) ?~))
+    (should (equal (plist-get record :text) "hello\n"))))
+
+(ert-deftest disasm-test-mi-parse-string-escapes ()
+  (let ((record (disasm-mi--parse-record ?^ "done,value=\"a\\\"b\\tc\"")))
+    (should (equal (disasm-mi-field (plist-get record :data) "value")
+                   "a\"b\tc"))))
+
+(ert-deftest disasm-test-mi-parse-octal-escape ()
+  (let ((record (disasm-mi--parse-record ?~ "\"\\101\"")))
+    (should (equal (plist-get record :text) "A"))))
+
+(ert-deftest disasm-test-mi-dispatch-correlates-token ()
+  (let* ((client (disasm-mi-client--create :acc ""))
+         (seen nil))
+    (push (cons 7 (lambda (record) (setq seen (disasm-mi-field
+                                               (plist-get record :data) "value"))))
+          (disasm-mi-client-pending client))
+    (disasm-mi--dispatch client "7^done,value=\"42\"")
+    (should (equal seen "42"))
+    (should (null (disasm-mi-client-pending client)))))
+
+(ert-deftest disasm-test-mi-dispatch-async ()
+  (let* ((client (disasm-mi-client--create :acc ""))
+         (records nil))
+    (setf (disasm-mi-client-on-record client)
+          (lambda (record _token) (push (plist-get record :class) records)))
+    (disasm-mi--dispatch client "*stopped,reason=\"breakpoint-hit\"")
+    (disasm-mi--dispatch client "=thread-created,id=\"1\"")
+    (should (equal records '("thread-created" "stopped")))))
+
+;;; GDB backend parsing
+
+(defconst disasm-test--info-registers
+  (concat
+   "rax            0x4ff70f2000        343447379968\n"
+   "rbx            0x0                 0\n"
+   "rsp            0x4ff77ff908        0x4ff77ff908\n"
+   "rip            0x7ff81b611121      0x7ff81b611121 <ntdll!DbgBreakPoint+1>\n"
+   "eflags         0x246               [ PF ZF IF ]\n"
+   "cs             0x33                51\n"
+   "xmm0           {v8_bfloat16 = {0x0}}\n"))
+
+(ert-deftest disasm-test-gdb-parse-registers ()
+  (pcase-let ((`(,registers ,flags)
+               (disasm-debug-gdb--parse-registers disasm-test--info-registers)))
+    (should (equal (cdr (assoc "rax" registers)) "0x4ff70f2000"))
+    (should (equal (cdr (assoc "rip" registers)) "0x7ff81b611121"))
+    (should (equal (cdr (assoc "cs" registers)) "0x33"))
+    (should (equal flags #x246))
+    (should (null (assoc "xmm0" registers)))))
+
+(defconst disasm-test--info-files
+  (concat
+   "Symbols from \"C:\\path\\dbgprog.exe\".\n"
+   "Local exec file:\n"
+   "\t`C:\\path\\dbgprog.exe', file type pei-x86-64.\n"
+   "\tEntry point: 0x7ff7c4c513f0\n"
+   "\t0x00007ff7c4c51000 - 0x00007ff7c4c526d8 is .text\n"
+   "\t0x00007ff7c4c5b000 - 0x00007ff7c4c5b078 is .reloc\n"
+   "\t0x00007ff81b571000 - 0x00007ff81b68a312 is .text in C:\\Windows\\SYSTEM32\\ntdll.dll\n"
+   "\t0x00007ff81b768000 - 0x00007ff81b768554 is .reloc in C:\\Windows\\SYSTEM32\\ntdll.dll\n"))
+
+(ert-deftest disasm-test-gdb-parse-info-files ()
+  (let* ((info (disasm-debug-gdb--parse-info-files disasm-test--info-files))
+         (modules (plist-get info :modules))
+         (main (cl-find-if #'disasm-debug-module-main-p modules))
+         (ntdll (cl-find-if (lambda (m)
+                              (string-match-p "ntdll" (disasm-debug-module-path m)))
+                            modules)))
+    (should (equal (plist-get info :main) "C:\\path\\dbgprog.exe"))
+    (should (= (plist-get info :entry) #x7ff7c4c513f0))
+    (should (= (plist-get info :bits) 64))
+    (should (= (length modules) 2))
+    (should (= (disasm-debug-module-from main) #x7ff7c4c51000))
+    (should (= (disasm-debug-module-to main) #x7ff7c4c5b078))
+    (should (= (disasm-debug-module-from ntdll) #x7ff81b571000))
+    (should (= (disasm-debug-module-to ntdll) #x7ff81b768554))))
+
+(ert-deftest disasm-test-gdb-parse-frames ()
+  (let* ((record (list :type ?^ :class "done"
+                       :data (list (cons "stack"
+                                         (list (list (cons "level" "0")
+                                                     (cons "addr" "0x401000")
+                                                     (cons "func" "main"))
+                                               (list (cons "level" "1")
+                                                     (cons "addr" "0x401100")
+                                                     (cons "func" "start")))))))
+         (frames (disasm-debug-gdb--frames-from-record record)))
+    (should (= (length frames) 2))
+    (should (= (disasm-debug-frame-addr (nth 0 frames)) #x401000))
+    (should (equal (disasm-debug-frame-func (nth 0 frames)) "main"))
+    (should (= (disasm-debug-frame-level (nth 1 frames)) 1))))
+
+;;; Address mapping and helpers
+
+(ert-deftest disasm-test-debug-first-vma ()
+  (let ((session (disasm-session--create
+                  :file "x" :bits 64
+                  :sections (list (disasm-section--create :name ".reloc" :vma #x1000 :size 0)
+                                  (disasm-section--create :name ".text" :vma #x401000 :size #x100)
+                                  (disasm-section--create :name ".data" :vma #x402000 :size #x100)))))
+    (should (= (disasm-debug--first-vma session) #x401000))))
+
+(ert-deftest disasm-test-debug-module-for-address ()
+  (let ((modules (list (disasm-debug-module--create :path "a" :from #x1000 :to #x2000)
+                       (disasm-debug-module--create :path "b" :from #x5000 :to #x6000))))
+    (should (equal (disasm-debug-module-path
+                    (disasm-debug-module-for-address modules #x1500)) "a"))
+    (should (equal (disasm-debug-module-path
+                    (disasm-debug-module-for-address modules #x5500)) "b"))
+    (should (null (disasm-debug-module-for-address modules #x3000)))))
+
+(ert-deftest disasm-test-debug-live-to-file ()
+  (let ((session (disasm-debug-session--create :delta #x1000)))
+    (should (= (disasm-debug--live-to-file session #x401000) #x400000))))
+
+(ert-deftest disasm-test-debug-flags ()
+  (should (disasm-debug-flag-set-p #x246 "ZF"))
+  (should (disasm-debug-flag-set-p #x246 "PF"))
+  (should (disasm-debug-flag-set-p #x246 "IF"))
+  (should-not (disasm-debug-flag-set-p #x246 "CF"))
+  (should-not (disasm-debug-flag-set-p #x246 "OF")))
+
+(ert-deftest disasm-test-debug-state-label ()
+  (should (equal (disasm-debug-session-state-label
+                  (disasm-debug-session--create :state 'stopped))
+                 "stopped")))
+
+;;; Process enumeration
+
+(ert-deftest disasm-test-proc-split-csv-line ()
+  (should (equal (disasm-proc--split-csv-line
+                  "\"System Idle Process\",\"0\",\"Services\",\"0\",\"8 K\"")
+                 '("System Idle Process" "0" "Services" "0" "8 K")))
+  (should (equal (disasm-proc--split-csv-line "\"a,b.exe\",\"12\"")
+                 '("a,b.exe" "12")))
+  (should (equal (disasm-proc--split-csv-line "\"he said \"\"hi\"\"\",\"1\"")
+                 '("he said \"hi\"" "1"))))
+
 (provide 'disasm-tests)
 ;;; disasm-tests.el ends here
