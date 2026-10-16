@@ -1,0 +1,8 @@
+# Byte-compiled output and native-compilation caches
+*.elc
+eln-cache/
+
+# Emacs backup/auto-save and lock files
+*~
+\#*\#
+.\#*
