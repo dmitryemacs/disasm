@@ -115,6 +115,15 @@ The functions pane fills the rest.  Used by the docked layout of
   :type 'integer
   :group 'disasm)
 
+(defcustom disasm-collapse-other-windows t
+  "Whether a multi-pane layout should take over the whole frame.
+When non-nil, every other window is deleted before the docked layout of
+`disasm-open' or the debug layout of `disasm-attach' is built, so the
+panes fill the frame instead of sharing it with unrelated buffers.
+When nil the layout is built into the current window arrangement."
+  :type 'boolean
+  :group 'disasm)
+
 (defcustom disasm-raw-arch "i386:x86-64"
   "Default architecture passed to objdump for raw (headerless) binaries.
 Used by `disasm-open-raw' together with the \"-b binary\" option."
@@ -287,6 +296,16 @@ COUNT defaults to the length of BYTES minus START."
   (if (and (integerp align) (> align 0))
       (- value (% value align))
     value))
+
+(defun disasm--collapse-other-windows (window)
+  "Make WINDOW the only window on its frame, when so configured.
+The docked and the debug layouts call this before splitting so that the
+panes take over the frame.  Does nothing when
+`disasm-collapse-other-windows' is nil or WINDOW is no longer live, and
+leaves frames it cannot collapse (side or atomic windows) as they are."
+  (when (and disasm-collapse-other-windows
+             (window-live-p window))
+    (ignore-errors (delete-other-windows window))))
 
 ;;; Synchronization hooks
 

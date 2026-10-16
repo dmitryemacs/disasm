@@ -410,25 +410,27 @@ Also refreshes the live hex pane, which follows the listing."
             (stack (disasm-debug-pane--get-buffer session 'stack))
             (hexbuf (disasm-debug--live-hex-buffer session)))
         (pop-to-buffer listing)
-        (let* ((win (or (get-buffer-window listing) (selected-window)))
-               (right (disasm--split-fraction win
-                                              (/ disasm-debug-sidebar-width 100.0)
-                                              'right))
-               (regwin (disasm--split-fraction right
-                                               (/ disasm-registers-split 100.0)
-                                               'above))
-               (flagwin (disasm--split-fraction right
-                                                (/ disasm-flags-split 100.0)
-                                                'above)))
-          (set-window-buffer regwin registers)
-          (set-window-buffer flagwin flags)
-          (set-window-buffer right stack)
-          ;; Left column: the live hex pane below the listing.
-          (let ((hexwin (disasm--split-fraction win
-                                                (/ disasm-hex-height 100.0)
-                                                'below)))
-            (set-window-buffer hexwin hexbuf))
-          (select-window win)))
+        (let ((win (or (get-buffer-window listing) (selected-window))))
+          ;; The debugger owns the frame: collapse every other window.
+          (disasm--collapse-other-windows win)
+          (let* ((right (disasm--split-fraction win
+                                                (/ disasm-debug-sidebar-width 100.0)
+                                                'right))
+                 (regwin (disasm--split-fraction right
+                                                 (/ disasm-registers-split 100.0)
+                                                 'above))
+                 (flagwin (disasm--split-fraction right
+                                                  (/ disasm-flags-split 100.0)
+                                                  'above)))
+            (set-window-buffer regwin registers)
+            (set-window-buffer flagwin flags)
+            (set-window-buffer right stack)
+            ;; Left column: the live hex pane below the listing.
+            (let ((hexwin (disasm--split-fraction win
+                                                  (/ disasm-hex-height 100.0)
+                                                  'below)))
+              (set-window-buffer hexwin hexbuf))
+            (select-window win))))
       (with-current-buffer listing
         (setq-local disasm-debug--laid-out t))
       (disasm-debug--set-drivers session)

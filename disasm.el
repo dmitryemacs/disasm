@@ -140,7 +140,10 @@ When RAW is non-nil, treat FILE as a headerless binary."
       (disasm-render))
     (if two-pane
         (disasm--open-docked session buffer)
-      (pop-to-buffer buffer))
+      (pop-to-buffer buffer)
+      ;; A single pane takes over the frame too.
+      (disasm--collapse-other-windows
+       (or (get-buffer-window buffer) (selected-window))))
     (disasm--begin-disassembly session buffer
                                (disasm-session-entry session))
     buffer))
@@ -163,22 +166,24 @@ pane sits below the listing in the left column."
         (secbuf (disasm-outline--get-buffer session 'sections))
         (fnbuf (disasm-outline--get-buffer session 'functions)))
     (pop-to-buffer buffer)
-    (let* ((disasm-win (or (get-buffer-window buffer) (selected-window)))
-           ;; Right column: sections on top, functions below.
-           (outwin (disasm--split-fraction disasm-win
-                                           (/ disasm-outline-width 100.0)
-                                           'right))
-           (fnwin (disasm--split-fraction outwin
-                                          (- 1 (/ disasm-outline-split 100.0))
-                                          'below)))
-      (set-window-buffer outwin secbuf)
-      (set-window-buffer fnwin fnbuf)
-      ;; Left column: the hex pane below the listing.
-      (let ((hexwin (disasm--split-fraction disasm-win
-                                            (/ disasm-hex-height 100.0)
+    (let ((disasm-win (or (get-buffer-window buffer) (selected-window))))
+      ;; The docked layout owns the frame.
+      (disasm--collapse-other-windows disasm-win)
+      (let* (;; Right column: sections on top, functions below.
+             (outwin (disasm--split-fraction disasm-win
+                                             (/ disasm-outline-width 100.0)
+                                             'right))
+             (fnwin (disasm--split-fraction outwin
+                                            (- 1 (/ disasm-outline-split 100.0))
                                             'below)))
-        (set-window-buffer hexwin hexbuf))
-      (select-window disasm-win))
+        (set-window-buffer outwin secbuf)
+        (set-window-buffer fnwin fnbuf)
+        ;; Left column: the hex pane below the listing.
+        (let ((hexwin (disasm--split-fraction disasm-win
+                                              (/ disasm-hex-height 100.0)
+                                              'below)))
+          (set-window-buffer hexwin hexbuf))
+        (select-window disasm-win)))
     (disasm-sync-mode 1)
     (disasm-sync--tick)
     buffer))
@@ -189,10 +194,12 @@ Used by `disasm-open-hex', which also works for listings opened as a
 single pane."
   (let ((hexbuf (disasm-hex--get-buffer session)))
     (pop-to-buffer buffer)
-    (let* ((disasm-win (or (get-buffer-window buffer) (selected-window)))
-           (hexwin (split-window disasm-win nil 'left)))
-      (set-window-buffer hexwin hexbuf)
-      (select-window disasm-win))
+    (let ((disasm-win (or (get-buffer-window buffer) (selected-window))))
+      ;; The two panes take over the frame.
+      (disasm--collapse-other-windows disasm-win)
+      (let ((hexwin (split-window disasm-win nil 'left)))
+        (set-window-buffer hexwin hexbuf)
+        (select-window disasm-win)))
     (disasm-sync-mode 1)
     (disasm-sync--tick)
     hexbuf))
